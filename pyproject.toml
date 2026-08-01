@@ -1,0 +1,68 @@
+[project]
+name = "chaihuo-reachy"
+version = "0.1.0"
+description = "柴火基地车 Reachy Mini 智能语音助手 — ASR/LLM/TTS via 阿里云百炼"
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = ["reachy-mini", "voice-assistant", "bailian", "mcv"]
+dependencies = [
+    "numpy>=2.0",
+    "websockets>=15.0,<16",
+    "httpx>=0.28.0",
+    "sounddevice>=0.4.6",
+    "pyyaml>=6.0",
+    "dashscope>=1.25.6",
+    "python-dotenv>=1.0",
+    # Camera: Reachy Mini USB camera via OpenCV (Mac + Jetson)
+    "opencv-python>=4.10",
+    # Memory: vector search for journal retrieval
+    "chromadb>=0.5",
+    # Wake word: local on-device detection
+    "pvporcupine>=3.0",
+    # Web dashboard
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    # Reachy daemon lifecycle; app media stays disabled because audio.py owns
+    # the one required full-duplex XMOS stream.
+    "reachy-mini>=1.8.0,<2",
+    "sherpa-onnx>=1.13.4",
+    "openwakeword>=0.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+chaihuo-reachy = "chaihuo_reachy.main:main"
+chaihuo-reachy-sdk = "chaihuo_reachy.reachy_app:main"
+
+[project.entry-points."reachy_mini_apps"]
+chaihuo_reachy = "chaihuo_reachy.reachy_app:ChaihuoReachyApp"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+exclude = [
+    "/data",
+    "/dist",
+    "/models",
+    "/.venv",
+    "/.pytest_cache",
+    "/.firecrawl",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chaihuo_reachy"]
+artifacts = [
+    "src/chaihuo_reachy/dashboard.html",
+    "src/chaihuo_reachy/profiles/**/*.txt",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
