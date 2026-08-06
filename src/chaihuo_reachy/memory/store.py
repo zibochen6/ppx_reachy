@@ -18,6 +18,17 @@ _QUERY_STOP_PHRASES = (
     "是什么", "为什么", "怎么", "哪里", "哪儿", "去过", "到过",
     "去了", "当天", "那天", "这件事", "一下", "什么",
 )
+_JOURNEY_QUERY_MARKERS = (
+    "哪些站点", "都去了", "都去过", "去过哪些", "行程", "旅程", "路线",
+    "途经", "途径", "一路", "回忆", "回顾",
+)
+_JOURNEY_QUERY_NOISE_TERMS = {
+    "我们", "你们", "哪些", "哪里", "站点", "精华", "回忆", "回顾",
+    "帮我", "一下", "请问", "基地", "地车", "日记", "行程", "旅程",
+    "路线", "发生", "什么", "都有", "都去", "去了", "去过", "哪些",
+    "有哪", "哪些", "给我", "一下", "一下", "回忆", "回顾", "精华",
+}
+_JOURNEY_TERM_EDGE_NOISE = set("我你他她它们在到从向往去都的了啊呀呢吗和与及把被给帮请问有哪些什么")
 
 
 def _body_from_cached_file(text: str) -> str:
@@ -296,6 +307,77 @@ class MemoryStore:
 
         ranked = sorted(best.values(), key=lambda item: item["score"], reverse=True)
         return ranked[:k]
+
+    def search_journey_scope(self, query: str, k: int = 6) -> list[dict[str, Any]]:
+        """Return a chronological group of entries for a region-wide journey.
+
+        Vector retrieval is useful for a specific event, but it can collapse a
+        question such as "山西都去了哪些站点" into one semantically similar day.
+        For explicit itinerary/recap questions, identify short place anchors
+        from the query that recur in the verified corpus and return all of the
+        matching diary entries in date order.
+        """
+        if not any(marker in query for marker in _JOURNEY_QUERY_MARKERS):
+            return []
+
+        compact_query = re.sub(r"\s+", "", query)
+        terms = {
+            compact_query[start:end]
+            for size in range(2, 5)
+            for start in range(max(0, len(compact_query) - size + 1))
+            for end in (start + size,)
+            if compact_query[start:end] not in _JOURNEY_QUERY_NOISE_TERMS
+            and compact_query[start] not in _JOURNEY_TERM_EDGE_NOISE
+            and compact_query[end - 1] not in _JOURNEY_TERM_EDGE_NOISE
+        }
+        entries: list[tuple[dict[str, Any], str, str]] = []
+        hits_by_term: dict[str, list[int]] = {term: [] for term in terms}
+        for entry in self._manifest_entries().values():
+            if entry.get("status") != "complete":
+                continue
+            path = Path(str(entry.get("file") or ""))
+            if not path.is_file():
+                continue
+            title = str(entry.get("title") or "")
+            content = _body_from_cached_file(path.read_text(encoding="utf-8"))
+            haystack = re.sub(r"\s+", "", f"{title}\n{content}")
+            index = len(entries)
+            entries.append((entry, title, content))
+            for term in terms:
+                if term in haystack:
+                    hits_by_term[term].append(index)
+
+        # A geographical anchor should connect several days, but terms that
+        # match most of the corpus are generic prose rather than a location.
+        anchor_terms = {
+            term
+            for term, indexes in hits_by_term.items()
+            if 2 <= len(indexes) <= max(12, len(entries) // 3)
+        }
+        if not anchor_terms:
+            return []
+
+        selected_indexes = {
+            index
+            for term in anchor_terms
+            for index in hits_by_term[term]
+        }
+        selected: list[dict[str, Any]] = []
+        for index in selected_indexes:
+            entry, title, content = entries[index]
+            metadata = {
+                "slug": entry.get("slug", ""),
+                "title": title,
+                "date": entry.get("date", ""),
+                "source_url": entry.get("source_url", ""),
+                "source_updated_at": entry.get("source_updated_at", ""),
+                "file": entry.get("file", ""),
+            }
+            selected.append(
+                self._item_from_metadata(metadata, score=1.0, snippet=content[:1200])
+            )
+        selected.sort(key=lambda item: (str(item.get("date") or ""), str(item.get("slug") or "")))
+        return selected[:k]
 
     def search_by_date(self, date_str: str, k: int = 3) -> list[dict[str, Any]]:
         if self._collection.count() == 0:

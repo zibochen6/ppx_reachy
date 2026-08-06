@@ -1,0 +1,30 @@
+# ── API keys & credentials ──────────────────────────────────────
+.env
+
+# ── Python ──────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# ── Local data (journals, chroma vector store, state) ───────────
+data/
+state/
+
+# ── Models ──────────────────────────────────────────────────────
+models/
+
+# ── IDE & OS ────────────────────────────────────────────────────
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Misc ────────────────────────────────────────────────────────
+*.log

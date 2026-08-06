@@ -272,6 +272,40 @@ def test_exact_chinese_title_match_beats_wrong_vector_neighbor(tmp_path: Path) -
     assert result[0]["score"] == 0.95
 
 
+def test_journey_scope_returns_every_matching_region_day_in_date_order(tmp_path: Path) -> None:
+    journal_dir = tmp_path / "journals"
+    journal_dir.mkdir()
+    entries = {}
+    for slug, date, content in (
+        ("shanxi-start", "2026-07-29", "基地车驶入山西临汾隰县。"),
+        ("shanxi-middle", "2026-07-31", "今天继续在山西临汾拜访学校。"),
+        ("shanxi-end", "2026-08-03", "山西太原的活动圆满结束。"),
+        ("xian", "2026-07-28", "西安收官日。"),
+    ):
+        path = journal_dir / f"{slug}.md"
+        path.write_text(content * 40, encoding="utf-8")
+        entries[slug] = {
+            "slug": slug,
+            "status": "complete",
+            "title": f"基地车日记 {slug}",
+            "date": date,
+            "file": str(path),
+            "source_url": f"https://example.test/{slug}",
+        }
+    (journal_dir / "manifest.json").write_text(
+        json.dumps({"entries": entries}, ensure_ascii=False), encoding="utf-8"
+    )
+
+    store = MemoryStore.__new__(MemoryStore)
+    store._journal_dir = journal_dir
+    store._manifest_path = journal_dir / "manifest.json"
+    result = store.search_journey_scope("我们在山西都去了哪些站点，帮我回忆一下", k=6)
+
+    assert [item["slug"] for item in result] == [
+        "shanxi-start", "shanxi-middle", "shanxi-end",
+    ]
+
+
 def test_compact_multi_day_title_covers_every_day() -> None:
     title = "基地车日记｜2026.05.18-20｜成都-江油-唐家河"
     assert _title_range_contains(title, "2026-05-18")

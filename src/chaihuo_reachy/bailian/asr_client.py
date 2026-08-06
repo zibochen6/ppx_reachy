@@ -38,6 +38,7 @@ class ASRResult:
     is_final: bool = False
     speech_started: bool = False
     speech_stopped: bool = False
+    error: str = ""
 
 
 class BailianASRClient:
@@ -62,6 +63,7 @@ class BailianASRClient:
         self._connected = False
         self._session_id: str | None = None
         self._speech_start_time: float | None = None  # monotonic timestamp
+        self._send_lock = asyncio.Lock()
 
     @property
     def is_connected(self) -> bool:
@@ -150,13 +152,14 @@ class BailianASRClient:
         while True:
             result = await self._result_queue.get()
             yield result
-            if result.is_final:
+            if result.is_final or result.error:
                 return
 
     async def _send(self, msg: dict) -> None:
         if self._ws is None:
             raise RuntimeError("ASR client not connected")
-        await self._ws.send(json.dumps(msg, ensure_ascii=False))
+        async with self._send_lock:
+            await self._ws.send(json.dumps(msg, ensure_ascii=False))
 
     async def _recv_loop(self) -> None:
         assert self._ws is not None
@@ -166,6 +169,8 @@ class BailianASRClient:
                 await self._dispatch(msg)
         except ConnectionClosed as e:
             logger.debug("ASR WebSocket closed: %s", e)
+            if self._connected:
+                await self._result_queue.put(ASRResult(text="", error=f"ASR connection closed: {e}"))
         except Exception:
             logger.exception("ASR recv loop error")
 
@@ -216,6 +221,8 @@ class BailianASRClient:
         elif msg_type == "session.finished":
             logger.info("🔌 ASR session finished")
         elif msg_type == "error":
-            logger.error("❌ ASR error: %s", msg.get("error", msg))
+            error = str(msg.get("error", msg))
+            logger.error("❌ ASR error: %s", error)
+            await self._result_queue.put(ASRResult(text="", error=error))
         else:
             logger.debug("ASR unhandled: %s", msg_type)

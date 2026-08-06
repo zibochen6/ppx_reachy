@@ -20,6 +20,11 @@ from chaihuo_reachy.camera import find_reachy_camera
 from chaihuo_reachy.config import Config, load_config
 from chaihuo_reachy.dashboard import ChatMessageStore, DashboardHub, run_websocket_session
 from chaihuo_reachy.engine import ConversationEngine
+from chaihuo_reachy import daemon_runtime
+from chaihuo_reachy.backends.interfaces import (
+    playback_gain_from_percent,
+    playback_percent_from_gain,
+)
 
 if TYPE_CHECKING:
     from chaihuo_reachy.backends.interfaces import AudioBackend, CameraBackend
@@ -233,6 +238,8 @@ function onMsg(m){
         curStreamId=null;
       }
     }
+  }else if(m.type==='asr_status'){
+    $('asrBox').textContent='🎤 '+m.status; $('asrBox').classList.add('active');
   }else if(m.type==='transcript'){
     if(m.final){
       if(m.text){
@@ -600,8 +607,9 @@ class _MJPEGStream:
 
     def stop(self) -> None:
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=1.0)
+        # Don't block on thread join — the capture thread may be stuck in
+        # a blocking camera read. The thread is a daemon and will die with
+        # the process. Release the camera to unblock any pending read.
         if self._cap:
             self._cap.release()
             self._cap = None
@@ -721,6 +729,7 @@ async def run_dashboard(
     import uvicorn
 
     app = FastAPI(title="皮皮虾 Dashboard")
+    started_at = time.time()
 
     # Resolve and open exactly one front-camera backend.  The MJPEG service,
     # VLM snapshots, and the engine all share this instance.
@@ -755,6 +764,7 @@ async def run_dashboard(
 
     engine.on_state_change(lambda s: broadcast({"type": "state", "state": s}))
     engine.on_transcript(lambda t, f: broadcast({"type": "transcript", "text": t, "final": f}))
+    engine.on_asr_status(lambda status: broadcast({"type": "asr_status", "status": status}))
     engine.on_emotion(lambda e: broadcast({"type": "emotion", "emotion": e}))
 
     def on_turn_event(event: dict[str, Any]) -> None:
@@ -825,7 +835,7 @@ async def run_dashboard(
                 {"type": "state", "state": engine._state},
                 {
                     "type": "volume",
-                    "volume": int(engine._audio.volume / 3.0 * 100)
+                    "volume": playback_percent_from_gain(engine._audio.volume)
                     if engine._audio
                     else 80,
                 },
@@ -838,12 +848,16 @@ async def run_dashboard(
         async def _handle_control(client: WebSocket, data: dict[str, Any]) -> None:
             event_type = data.get("type", "")
             if event_type == "get_volume":
-                volume = int(engine._audio.volume / 3.0 * 100) if engine._audio else 80
+                volume = (
+                    playback_percent_from_gain(engine._audio.volume)
+                    if engine._audio
+                    else 80
+                )
                 await client.send_json({"type": "volume", "volume": volume})
             elif event_type == "set_volume":
                 volume = max(0, min(100, int(data.get("volume", 80))))
                 if engine._audio:
-                    engine._audio.volume = volume / 100.0 * 3.0
+                    engine._audio.volume = playback_gain_from_percent(volume)
                 broadcast({"type": "volume", "volume": volume})
             elif event_type == "get_wake_word":
                 await client.send_json(
@@ -1015,9 +1029,38 @@ async def run_dashboard(
             ),
             "chat_messages": chat.message_count,
             "chat_captures": chat.capture_count,
-            "volume": int(engine._audio.volume / 3.0 * 100) if engine._audio else 0,
+            "volume": (
+                playback_percent_from_gain(engine._audio.volume)
+                if engine._audio
+                else 0
+            ),
             "wake_word_enabled": cfg.enable_wake_word,
             "ws_subscribers": hub.subscriber_count,
+        })
+
+    @app.get("/healthz")
+    async def healthz() -> JSONResponse:
+        """Liveness endpoint that reports robot readiness without secrets."""
+        try:
+            from importlib.metadata import version
+
+            app_version = version("chaihuo-reachy")
+        except Exception:
+            app_version = "unknown"
+        return JSONResponse({
+            "status": "ok",
+            "version": app_version,
+            "started_at": started_at,
+            "sdk_connected": bool(sdk_status.get("sdk_connected")),
+            "robot_ready": bool(sdk_status.get("robot_ready")),
+            "robot_status": sdk_status.get("robot_status", "degraded"),
+            "daemon_health": sdk_status.get("daemon_health", "unavailable"),
+            "daemon_owner": sdk_status.get("daemon_owner", "none"),
+            "daemon_error": sdk_status.get("daemon_error"),
+            "audio_backend": (
+                engine._audio.backend_name if engine._audio is not None else "unavailable"
+            ),
+            "state": engine._state,
         })
 
     @app.get("/captures/{capture_id}")
@@ -1314,12 +1357,25 @@ async def run_diagnostic(cfg: Config) -> None:
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def _daemon_hosts(cfg: Config) -> list[str]:
-    """Return connection targets in local-first order without duplicates."""
-    hosts = ["localhost"]
+    """Return the configured daemon target without probing unrelated daemons."""
     configured = str(cfg.daemon_host or "").strip()
-    if configured and configured not in {"localhost", "127.0.0.1", "::1"}:
-        hosts.append(configured)
-    return hosts
+    return [configured or "localhost"]
+
+
+async def _daemon_port_is_occupied(cfg: Config) -> bool:
+    """Detect a local listener without inspecting or terminating its process."""
+    if cfg.daemon_host not in {"", "localhost", "127.0.0.1", "::1"}:
+        return False
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("localhost", cfg.daemon_port), timeout=0.3
+        )
+        del reader
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except Exception:
+        return False
 
 
 async def _connect_reachy_once(
@@ -1342,23 +1398,77 @@ async def _connect_reachy_once(
             "local" if cfg.media_backend != "no_media" else "no_media"
         ),
         spawn_daemon=False,
-        use_sim=False,
+        use_sim=cfg.daemon_simulation,
         timeout=_DAEMON_CONNECT_TIMEOUT_S,
     )
 
 
-def _spawn_sdk_daemon_process():
-    """Start the SDK daemon and retain an owned process handle for cleanup."""
+def _resolve_daemon_serial_port(cfg: Config) -> str:
+    """Resolve an explicitly configured controller, with safe USB recovery."""
+    configured = str(cfg.daemon_serial_port or "").strip()
+    if cfg.daemon_simulation:
+        return configured
+    if configured and Path(configured).exists():
+        return configured
+    candidates = sorted(Path("/dev").glob("cu.usbmodem*"))
+    if len(candidates) == 1:
+        resolved = str(candidates[0])
+        logger.warning("配置串口不可用，自动恢复唯一 USB 串口: %s", resolved)
+        return resolved
+    if configured:
+        if len(candidates) > 1:
+            raise RuntimeError(
+                f"配置串口不存在，发现多个候选串口: {', '.join(map(str, candidates))}"
+            )
+        raise RuntimeError(f"配置串口不存在且未发现 /dev/cu.usbmodem* 设备: {configured}")
+    if len(candidates) > 1:
+        raise RuntimeError(f"未配置串口，发现多个候选串口: {', '.join(map(str, candidates))}")
+    if not candidates:
+        raise RuntimeError("未配置串口且未发现 /dev/cu.usbmodem* 设备")
+    return str(candidates[0])
+
+
+def _spawn_sdk_daemon_process(cfg: Config, resolved_serial_port: str | None = None):
+    """Start the SDK daemon and retain an owned process handle for cleanup.
+
+    Hardware mode is the default. MuJoCo simulation must be explicitly opted
+    into because the plain Reachy Mini package does not install its optional
+    ``mujoco`` dependency.
+    """
     import shutil
     import subprocess
 
     executable = shutil.which("reachy-mini-daemon")
     if not executable:
         raise RuntimeError("reachy-mini-daemon executable was not found")
-    return subprocess.Popen(
-        [executable],
-        start_new_session=True,
-    )
+    command = [executable]
+    # Validation/recovery is performed by the lifecycle flow before this
+    # low-level launcher is called.  Keeping the launcher deterministic also
+    # makes it usable by deployment tooling that already resolved a device.
+    serial_port = resolved_serial_port
+    if serial_port is None and not cfg.daemon_simulation:
+        serial_port = cfg.daemon_serial_port
+    if serial_port:
+        command.extend(["--serialport", serial_port])
+    if cfg.daemon_simulation:
+        command.append("--sim")
+    if cfg.media_backend == "no_media":
+        command.append("--no-media")
+    process = subprocess.Popen(command, start_new_session=True)
+    if getattr(process, "pid", None):
+        daemon_runtime.write_state(
+            cfg.daemon_state_file,
+            daemon_runtime.make_state(
+                process,
+                command,
+                host=cfg.daemon_host,
+                port=cfg.daemon_port,
+                serial_port=serial_port or "",
+                simulation=cfg.daemon_simulation,
+                no_media=cfg.media_backend == "no_media",
+            ),
+        )
+    return process
 
 
 async def _find_reachy_daemon(
@@ -1379,6 +1489,21 @@ async def _find_reachy_daemon(
         attempt += 1
         for host in _daemon_hosts(cfg):
             try:
+                backend_error = await _daemon_backend_error(host, cfg.daemon_port, cfg)
+                if backend_error:
+                    # A daemon accepts SDK connections before its asynchronous
+                    # motor wake-up completes.  For the exact process we just
+                    # started, ``ready=false`` is an initialization state, not
+                    # a terminal fault.  Existing daemons are still rejected
+                    # immediately so Dashboard can safely enter degraded mode.
+                    if not _daemon_is_initializing(backend_error, daemon_process):
+                        raise _DaemonStartupError(backend_error)
+                    logger.info("Reachy daemon 正在初始化硬件，等待 ready=true...")
+                    continue
+                # While a daemon is waking, repeatedly constructing an SDK
+                # client also constructs local GStreamer media pipelines.  Do
+                # the inexpensive HTTP readiness poll first and open SDK
+                # media only once the daemon reports a usable backend.
                 reachy = await _connect_reachy_once(reachy_cls, cfg, host)
                 logger.info(
                     "✅ Reachy Mini daemon 已就绪 (host=%s, 尝试=%d)",
@@ -1391,17 +1516,44 @@ async def _find_reachy_daemon(
                 backend_error = await _daemon_backend_error(
                     host,
                     cfg.daemon_port,
+                    cfg,
                 )
                 if backend_error:
-                    raise _DaemonStartupError(backend_error)
+                    if not _daemon_is_initializing(backend_error, daemon_process):
+                        raise _DaemonStartupError(backend_error)
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             return None
         await asyncio.sleep(min(_DAEMON_POLL_INTERVAL_S, remaining))
 
 
-async def _daemon_backend_error(host: str, port: int) -> str:
-    """Read a terminal backend error from a daemon whose HTTP server is up."""
+def _daemon_is_initializing(error: str, daemon_process: Any | None) -> bool:
+    """Whether a just-spawned daemon should receive another readiness poll."""
+    return (
+        daemon_process is not None
+        and daemon_process.poll() is None
+        and "backend_status.ready=false" in error
+    )
+
+
+def _backend_reports_live_control(backend: dict[str, Any]) -> bool:
+    """Accept the SDK 1.9 false-negative ready flag only with live control."""
+    stats = backend.get("control_loop_stats")
+    return (
+        str(backend.get("motor_control_mode") or "").lower() == "enabled"
+        and isinstance(stats, dict)
+        and int(stats.get("nb_error", 1)) == 0
+        and float(stats.get("mean_control_loop_frequency", 0.0)) >= 20.0
+    )
+
+
+async def _daemon_backend_error(host: str, port: int, cfg: Config | None = None) -> str:
+    """Validate daemon HTTP health when its status endpoint is reachable.
+
+    A Reachy client socket can be accepted while the motor backend is still in
+    an error state.  The status payload is therefore the authority for robot
+    readiness, not merely a successful TCP/SDK connection.
+    """
     import httpx
 
     try:
@@ -1410,11 +1562,37 @@ async def _daemon_backend_error(host: str, port: int) -> str:
                 f"http://{host}:{port}/api/daemon/status"
             )
         if response.status_code != 200:
-            return ""
+            return f"daemon 健康检查返回 HTTP {response.status_code}"
         payload = response.json()
+        if not isinstance(payload, dict):
+            return "daemon 健康检查返回了无效数据"
         state = str(payload.get("state") or "").lower()
-        if state == "error":
+        if state != "running":
             return str(payload.get("error") or "Reachy daemon backend failed")
+        if payload.get("error"):
+            return str(payload["error"])
+        backend = payload.get("backend_status")
+        if not isinstance(backend, dict):
+            return "daemon 未返回 backend_status，无法确认机器人已就绪"
+        if backend.get("error"):
+            return str(backend["error"])
+        if backend.get("ready") is not True:
+            # reachy-mini 1.9 on physical hardware can keep ``ready=false``
+            # after a successful wake-up.  A running, error-free controller
+            # with a live 20+ Hz loop is a stronger safety signal than that
+            # stale flag.  Do not endlessly reopen media pipelines waiting for
+            # a value the daemon never updates.
+            if _backend_reports_live_control(backend):
+                logger.warning(
+                    "daemon backend ready=false，但电机控制环正常运行；按兼容模式继续"
+                )
+                return ""
+            return "机器人硬件未就绪 (backend_status.ready=false)"
+        if cfg and cfg.daemon_simulation:
+            if payload.get("simulation_enabled") is not True:
+                return "daemon 非模拟模式，与 REACHY_DAEMON_SIMULATION=true 不匹配"
+        elif cfg and payload.get("simulation_enabled") is True:
+            return "daemon 为模拟模式，与物理硬件配置不匹配"
     except Exception:
         return ""
     return ""
@@ -1443,8 +1621,21 @@ async def _sleep_reachy_on_shutdown(reachy: Any | None, cfg: Config) -> bool:
     """Put the robot in its safe resting pose before releasing the daemon."""
     if reachy is None or not cfg.auto_sleep:
         return True
-    if getattr(reachy, "_chaihuo_robot_slept", False):
+    if (
+        getattr(reachy, "_chaihuo_robot_slept", False)
+        or getattr(reachy, "_chaihuo_robot_sleeping", False)
+    ):
         return True
+    daemon_process = getattr(reachy, "_chaihuo_daemon_process", None)
+    if daemon_process is not None and daemon_process.poll() is None:
+        # An owned daemon runs goto_sleep as part of its SIGTERM shutdown.
+        # Calling it through the client as well produces a second stop cue.
+        setattr(reachy, "_chaihuo_robot_slept", True)
+        logger.info("本项目 daemon 将在退出时让皮皮虾休眠")
+        return True
+    # The two Dashboard cleanup layers can overlap during Ctrl+C.  Claim the
+    # operation before its first await so only one command reaches the robot.
+    setattr(reachy, "_chaihuo_robot_sleeping", True)
     logger.info("🛌 Ctrl+C/退出：正在让皮皮虾休眠...")
     try:
         await asyncio.wait_for(
@@ -1457,11 +1648,65 @@ async def _sleep_reachy_on_shutdown(reachy: Any | None, cfg: Config) -> bool:
     except Exception:
         logger.exception("退出时 goto_sleep 失败")
         return False
+    finally:
+        setattr(reachy, "_chaihuo_robot_sleeping", False)
 
 
-async def _terminate_owned_daemon(process: Any | None) -> None:
+def _daemon_owner(cfg: Config) -> str:
+    """Classify daemon ownership from the persisted, validated manifest."""
+    state = daemon_runtime.read_state(cfg.daemon_state_file)
+    if state is None:
+        return "none"
+    if daemon_runtime.owned_process(state):
+        return "owned"
+    # A state file is not authority by itself.  Remove stale records so a
+    # future ``spawn`` can proceed; a mismatched live process is left alone.
+    daemon_runtime.remove_state(cfg.daemon_state_file)
+    return "none"
+
+
+async def _recover_owned_daemon(cfg: Config) -> bool:
+    """Request graceful shutdown of only a manifest-verified daemon."""
+    if _daemon_owner(cfg) != "owned":
+        return False
+    stopped = await asyncio.to_thread(
+        daemon_runtime.terminate_owned_state,
+        cfg.daemon_state_file,
+    )
+    if stopped:
+        logger.info("已回收本项目记录的 reachy-mini-daemon")
+        await asyncio.sleep(0.5)
+    return stopped
+
+
+def _degraded_sdk_status(cfg: Config, reason: str, *, owner: str | None = None) -> dict[str, Any]:
+    return {
+        "sdk_connected": False,
+        "mode": "standalone_degraded",
+        "robot_ready": False,
+        "robot_status": "degraded",
+        "daemon_health": "unavailable",
+        "daemon_owner": owner or _daemon_owner(cfg),
+        "daemon_error": reason or "daemon 不可用",
+        "daemon_host": cfg.daemon_host,
+        "daemon_port": cfg.daemon_port,
+        "serial_port": cfg.daemon_serial_port or None,
+        "media_backend": "direct",
+    }
+
+
+async def _terminate_owned_daemon(
+    process: Any | None,
+    *,
+    state_file: str | None = None,
+) -> None:
     """Terminate only the exact daemon process spawned by this application."""
     if process is None or process.poll() is not None:
+        state = daemon_runtime.read_state(state_file) if state_file else None
+        if state_file and (
+            state is None or state.get("pid") == getattr(process, "pid", None)
+        ):
+            daemon_runtime.remove_state(state_file)
         return
     logger.info("正在停止本次启动的 reachy-mini-daemon (PID %s)...", process.pid)
     process.terminate()
@@ -1472,6 +1717,10 @@ async def _terminate_owned_daemon(process: Any | None) -> None:
         process.kill()
         await asyncio.to_thread(process.wait)
     logger.info("✅ reachy-mini-daemon 已停止")
+    if state_file:
+        state = daemon_runtime.read_state(state_file)
+        if state is None or state.get("pid") == getattr(process, "pid", None):
+            daemon_runtime.remove_state(state_file)
 
 
 async def _close_reachy_runtime(reachy: Any | None) -> None:
@@ -1480,8 +1729,9 @@ async def _close_reachy_runtime(reachy: Any | None) -> None:
         return
     if getattr(reachy, "_chaihuo_runtime_closed", False):
         return
+    daemon_process = getattr(reachy, "_chaihuo_daemon_process", None)
     media_manager = getattr(reachy, "media_manager", None)
-    if media_manager is not None:
+    if media_manager is not None and daemon_process is None:
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(media_manager.close),
@@ -1489,20 +1739,21 @@ async def _close_reachy_runtime(reachy: Any | None) -> None:
             )
         except Exception:
             logger.warning("SDK media manager 关闭超时或失败", exc_info=True)
+    elif daemon_process is not None:
+        logger.debug("本项目 daemon 负责关闭 SDK media manager")
     await _terminate_owned_daemon(
-        getattr(reachy, "_chaihuo_daemon_process", None)
+        daemon_process,
+        state_file=getattr(reachy, "_chaihuo_daemon_state_file", None),
     )
     setattr(reachy, "_chaihuo_runtime_closed", True)
 
 
-async def _try_connect_daemon(cfg: Config) -> tuple:
+async def _try_connect_daemon_impl(cfg: Config) -> tuple:
     """Try to connect to the Reachy Mini daemon and set up SDK backends.
 
-    Strategy:
-    1. Connect to an already-running daemon (fast path).
-    2. If that fails, auto-spawn the SDK daemon exactly once.
-    3. Wait for SDK daemon readiness and surface terminal hardware errors.
-    4. If unavailable, fall back to standalone Direct backends.
+    ``auto`` reuses a healthy daemon and starts a local one only when absent.
+    ``connect`` never starts a process.  ``spawn`` may first recover only a
+    daemon that is verified by this project's ownership manifest.
 
     Returns:
         (reachy, audio_backend, camera_backend, motion, sdk_status)
@@ -1510,7 +1761,13 @@ async def _try_connect_daemon(cfg: Config) -> tuple:
     """
     from reachy_mini import ReachyMini
 
-    # ── Strategy 1: Connect to an existing daemon ───────────────────
+    mode = str(cfg.daemon_mode or "auto").strip().lower()
+    if mode not in {"auto", "connect", "spawn"}:
+        return (None, None, None, None, _degraded_sdk_status(
+            cfg, f"无效的 REACHY_DAEMON_MODE: {cfg.daemon_mode}"
+        ))
+
+    # ── Strategy 1: connect without assuming ownership ───────────────
     terminal_error = ""
     daemon_process = None
     try:
@@ -1518,14 +1775,35 @@ async def _try_connect_daemon(cfg: Config) -> tuple:
     except _DaemonStartupError as exc:
         reachy = None
         terminal_error = str(exc)
+    if reachy is None and mode == "spawn":
+        # Explicit recovery mode never touches a daemon not recorded by us.
+        await _recover_owned_daemon(cfg)
+        terminal_error = ""
 
-    if reachy is None and not terminal_error:
-        # ── Strategy 2: Spawn exactly once, then wait for readiness ──
-        logger.info("无运行中的 daemon，正在拉起 Reachy Mini 进程...")
+    can_spawn_locally = cfg.daemon_host in {"", "localhost", "127.0.0.1", "::1"}
+    if (
+        reachy is None
+        and not terminal_error
+        and mode == "auto"
+        and can_spawn_locally
+        and await _daemon_port_is_occupied(cfg)
+    ):
+        terminal_error = "本机 daemon 端口已被外部或异常进程占用，auto 模式不会接管"
+    if reachy is None and not terminal_error and mode != "connect" and can_spawn_locally:
+        # ── Strategy 2: spawn once, then wait for strict readiness ──
+        logger.info("未发现健康的本机 daemon，正在拉起 Reachy Mini 进程...")
         try:
+            serial_port = await asyncio.to_thread(_resolve_daemon_serial_port, cfg)
+            # Persist the runtime-selected port in the in-memory status so
+            # operators can see which controller was actually used.
+            if serial_port:
+                cfg.daemon_serial_port = serial_port
             daemon_process = await asyncio.to_thread(
-                _spawn_sdk_daemon_process
+                _spawn_sdk_daemon_process, cfg, serial_port
             )
+            # The public wrapper uses this exact handle to finish daemon
+            # shutdown if Ctrl+C arrives before this function returns it.
+            setattr(cfg, "_chaihuo_starting_daemon_process", daemon_process)
         except Exception as exc:
             terminal_error = str(exc)
             logger.error("无法拉起 SDK daemon：%s", terminal_error)
@@ -1546,19 +1824,23 @@ async def _try_connect_daemon(cfg: Config) -> tuple:
                 logger.error("Reachy daemon 硬件初始化失败：%s", terminal_error)
 
     if reachy is None:
-        await _terminate_owned_daemon(daemon_process)
-        if terminal_error:
-            logger.error(
-                "Daemon 不可用 — 使用 standalone 模式；硬件错误：%s",
-                terminal_error,
-            )
-        else:
-            logger.info("Daemon 不可用 — 使用 standalone 模式")
-        return (None, None, None, None, None)
+        await _terminate_owned_daemon(daemon_process, state_file=cfg.daemon_state_file)
+        setattr(cfg, "_chaihuo_starting_daemon_process", None)
+        if not terminal_error:
+            if mode == "connect":
+                terminal_error = "connect 模式下未发现健康 daemon"
+            elif not can_spawn_locally:
+                terminal_error = "远程 daemon 不可用；auto/spawn 不会在远程地址拉起本地进程"
+            else:
+                terminal_error = "未发现健康 daemon"
+        logger.error("Daemon 不可用 — Dashboard 将以降级模式启动：%s", terminal_error)
+        return (None, None, None, None, _degraded_sdk_status(cfg, terminal_error))
 
     # Explicit ownership marker: only a daemon started by this invocation
     # may be terminated when Ctrl+C is received.
     setattr(reachy, "_chaihuo_daemon_process", daemon_process)
+    if daemon_process is not None:
+        setattr(reachy, "_chaihuo_daemon_state_file", cfg.daemon_state_file)
 
     # ── Wake up the robot ──────────────────────────────────────────
     robot_ready = True
@@ -1592,11 +1874,43 @@ async def _try_connect_daemon(cfg: Config) -> tuple:
         "mode": "daemon_connected",
         "media_backend": "sdk_gstreamer" if cfg.media_backend != "no_media" else "direct",
         "robot_ready": robot_ready,
+        "robot_status": "ready" if robot_ready else "degraded",
+        "daemon_health": "healthy",
+        "daemon_owner": (
+            "owned" if daemon_process is not None or _daemon_owner(cfg) == "owned"
+            else "external"
+        ),
+        "daemon_error": None,
         "daemon_host": getattr(getattr(reachy, "client", None), "host", cfg.daemon_host),
         "daemon_port": cfg.daemon_port,
+        "serial_port": cfg.daemon_serial_port or None,
     }
     logger.info("✅ Daemon 连接成功: %s", sdk_status)
     return (reachy, audio_backend, camera_backend, motion, sdk_status)
+
+
+async def _try_connect_daemon(cfg: Config) -> tuple:
+    """Connect with cancellation-safe cleanup for a daemon still starting."""
+    try:
+        return await _try_connect_daemon_impl(cfg)
+    except asyncio.CancelledError:
+        daemon_process = getattr(cfg, "_chaihuo_starting_daemon_process", None)
+        if daemon_process is not None:
+            logger.info("收到 Ctrl+C，正在停止本次启动的 daemon，使机器人坐下...")
+            try:
+                await _terminate_owned_daemon(
+                    daemon_process,
+                    state_file=cfg.daemon_state_file,
+                )
+            except asyncio.CancelledError:
+                # A second Ctrl+C must not prevent the safe signal from being
+                # delivered, even though it may skip waiting for completion.
+                try:
+                    daemon_process.terminate()
+                except Exception:
+                    logger.debug("Ctrl+C 后 daemon 终止信号发送失败", exc_info=True)
+                raise
+        raise
 
 
 def main() -> None:
@@ -1661,9 +1975,12 @@ async def _index_all_journals(cfg: Config) -> None:
     )
     results = await fetcher.sync(memory_store=store, refresh_all=True)
     health = fetcher.health()
-    if health["expected"] != health["complete"] or len(results) != health["expected"]:
-        raise RuntimeError(
-            f"日记完整性检查失败：官方 {health['expected']}，完整 {health['complete']}"
+    if health["expected"] != health["complete"]:
+        logger.warning(
+            "日记不完整：官方 %d 篇，完整 %d 篇（%d 篇不可访问）",
+            health["expected"],
+            health["complete"],
+            health["expected"] - health["complete"],
         )
     print(
         f"✅ 官方目录 {health['expected']} 篇，完整保存 {health['complete']} 篇，"

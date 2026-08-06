@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
+import time
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,8 +68,16 @@ async def test_daemon_spawn_timeout_polls_same_process_until_ready(monkeypatch) 
     monkeypatch.setattr(
         main_module,
         "_spawn_sdk_daemon_process",
-        lambda: process,
+        lambda *_args: process,
     )
+    monkeypatch.setattr(
+        main_module,
+        "_resolve_daemon_serial_port",
+        lambda _cfg: "/dev/cu.usbmodem-test",
+    )
+    async def port_available(_cfg):
+        return False
+    monkeypatch.setattr(main_module, "_daemon_port_is_occupied", port_available)
     monkeypatch.setattr(
         "chaihuo_reachy.backends.factory.create_audio_backend",
         lambda _cfg, _manager: SimpleNamespace(backend_name="fake-audio"),
@@ -94,7 +104,7 @@ async def test_daemon_spawn_timeout_polls_same_process_until_ready(monkeypatch) 
 
 
 @pytest.mark.asyncio
-async def test_owned_daemon_shutdown_sleeps_robot_then_stops_process() -> None:
+async def test_owned_daemon_shutdown_lets_daemon_sleep_then_stops_process() -> None:
     from chaihuo_reachy import main as main_module
     from chaihuo_reachy.config import Config
 
@@ -133,13 +143,35 @@ async def test_owned_daemon_shutdown_sleeps_robot_then_stops_process() -> None:
     assert await main_module._sleep_reachy_on_shutdown(reachy, Config())
     await main_module._close_reachy_runtime(reachy)
 
-    assert events == ["sleep", "media_close", "terminate", "wait"]
+    # The daemon performs its own single goto_sleep during SIGTERM shutdown.
+    # Calling through the client as well produces a duplicate stop prompt.
+    assert events == ["terminate", "wait"]
 
     # The outer startup guard may run after run_dashboard's own finally.
     # Cleanup is intentionally idempotent.
     assert await main_module._sleep_reachy_on_shutdown(reachy, Config())
     await main_module._close_reachy_runtime(reachy)
-    assert events == ["sleep", "media_close", "terminate", "wait"]
+    assert events == ["terminate", "wait"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_external_shutdown_requests_send_one_sleep_command() -> None:
+    from chaihuo_reachy import main as main_module
+    from chaihuo_reachy.config import Config
+
+    calls: list[str] = []
+
+    def goto_sleep() -> None:
+        calls.append("sleep")
+        time.sleep(0.02)
+
+    reachy = SimpleNamespace(goto_sleep=goto_sleep)
+    await asyncio.gather(
+        main_module._sleep_reachy_on_shutdown(reachy, Config()),
+        main_module._sleep_reachy_on_shutdown(reachy, Config()),
+    )
+
+    assert calls == ["sleep"]
 
 
 @pytest.mark.asyncio
@@ -197,4 +229,4 @@ async def test_dashboard_initialization_error_still_cleans_owned_daemon(
     with pytest.raises(RuntimeError, match="audio initialization failed"):
         await main_module._start_dashboard(Config())
 
-    assert events == ["sleep", "media_close", "terminate", "wait"]
+    assert events == ["terminate", "wait"]

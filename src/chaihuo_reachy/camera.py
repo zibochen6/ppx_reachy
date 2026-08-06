@@ -385,11 +385,9 @@ class Camera:
             self._ffmpeg = None
             if process.poll() is None:
                 process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=2)
+                # Don't block the event loop — let the OS reap the process.
+                # The ffmpeg process reads from a pipe that will close, so it
+                # will exit on its own shortly after terminate().
             self._ffmpeg_buffer.clear()
             self._prefetched_jpeg = None
             logger.info("Named AVFoundation camera closed")

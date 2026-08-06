@@ -112,6 +112,7 @@ def test_browser_uses_page_host_and_normalized_chat_protocol() -> None:
     assert 'window.location.protocol==="file:"' in DASHBOARD_HTML
     assert 'http://localhost:8640/' in DASHBOARD_HTML
     assert "dbCam" not in DASHBOARD_HTML
+    assert 'm.type==="asr_status"' in DASHBOARD_HTML
 
 
 def test_chat_store_replays_both_sides_sources_and_capture() -> None:

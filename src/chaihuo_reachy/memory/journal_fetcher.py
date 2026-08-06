@@ -582,10 +582,12 @@ class JournalFetcher:
         self._write_manifest(new_manifest)
 
         if missing:
-            raise RuntimeError(
-                f"日记同步不完整：官方 {len(expected_slugs)} 篇，"
-                f"完整保存 {len(complete_by_slug)} 篇，缺少 {len(missing)} 篇；"
-                f"{'; '.join(failures[:3])}"
+            logger.warning(
+                "日记同步不完整：官方 %d 篇，完整保存 %d 篇，缺少 %d 篇；%s",
+                len(expected_slugs),
+                len(complete_by_slug),
+                len(missing),
+                "; ".join(failures[:3]),
             )
 
         if memory_store is not None:

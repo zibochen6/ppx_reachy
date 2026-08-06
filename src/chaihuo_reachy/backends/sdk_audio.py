@@ -11,9 +11,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, AsyncIterator
 
 import numpy as np
+
+from chaihuo_reachy.backends.interfaces import MAX_PLAYBACK_GAIN
 
 if TYPE_CHECKING:
     from reachy_mini.media.media_manager import MediaManager
@@ -54,6 +57,7 @@ class SdkAudioIO:
         self._capture_task: asyncio.Task | None = None
         self._playback_event = threading.Event()
         self._playback_pending = False   # True while audio has been pushed and not yet drained
+        self._playback_deadline = 0.0
         self._capture_rms: float = 0.0   # Smoothed mic input level for diagnostics
 
         # Resampling state (simple linear interpolation)
@@ -124,7 +128,7 @@ class SdkAudioIO:
 
     # ── Playback ─────────────────────────────────────────────────────
 
-    def play(self, pcm: bytes) -> None:
+    async def play(self, pcm: bytes) -> None:
         """Queue PCM int16 mono for playback via push_audio_sample.
 
         Performs volume gain, tanh soft-clip, int16→float32 conversion,
@@ -153,6 +157,12 @@ class SdkAudioIO:
 
             self._mm.push_audio_sample(stereo)
             self._playback_pending = True
+            # The SDK does not expose a queue-drained notification. Track the
+            # submitted PCM duration and retain a small hardware tail window.
+            now = time.monotonic()
+            self._playback_deadline = max(now, self._playback_deadline) + (
+                len(samples) / self._sr
+            )
 
             # Update RMS
             rms = float(np.sqrt(np.mean(samples**2)))
@@ -163,17 +173,32 @@ class SdkAudioIO:
 
     def stop_playback(self) -> None:
         """Immediately clear playback queue (barge-in)."""
-        self._mm.clear_player()
+        # MediaManager 1.9 has no clear_player(). Restarting its output
+        # pipeline is the documented stop mechanism and drops queued PCM.
+        # Never let an interrupt failure take down the LLM turn.
+        try:
+            self._mm.stop_playing()
+            if self._playing:
+                self._mm.start_playing()
+        except Exception:
+            logger.warning("SDK playback stop failed", exc_info=True)
         self._play_rms = 0.0
+        self._playback_pending = False
+        self._playback_deadline = 0.0
 
     def mark_playback_done(self) -> None:
         """Signal end of playback — no more audio will be queued."""
         self._playback_event.set()
-        self._playback_pending = False
+        if self._playback_pending:
+            self._playback_deadline = max(
+                self._playback_deadline, time.monotonic()
+            ) + 0.3
 
     @property
     def is_playing(self) -> bool:
         """True while audio has been queued and not yet marked as drained."""
+        if self._playback_pending and time.monotonic() >= self._playback_deadline:
+            self._playback_pending = False
         return self._playback_pending
 
     @property
@@ -189,7 +214,7 @@ class SdkAudioIO:
 
     @volume.setter
     def volume(self, val: float) -> None:
-        self._volume = max(0.0, min(3.0, val))
+        self._volume = max(0.0, min(MAX_PLAYBACK_GAIN, float(val)))
 
     def play_rms(self) -> float:
         return self._play_rms

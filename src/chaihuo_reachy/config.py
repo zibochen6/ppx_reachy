@@ -8,11 +8,14 @@ Supports two deployment targets:
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger("chaihuo_reachy.config")
 
 # Auto-load .env file from project root on import
 try:
@@ -46,9 +49,10 @@ class Config:
 
     # ── ASR settings ───────────────────────────────────────────────────
     asr_language: str = "zh"
-    asr_vad_silence_ms: int = 500   # server-side VAD silence threshold (xiaozhi-style)
+    asr_vad_silence_ms: int = 1100  # Normal server-side endpoint window
     asr_vad_threshold: float = 0.35  # VAD sensitivity — lower = more sensitive
-    asr_turn_timeout_s: float = 15.0
+    asr_initial_silence_timeout_s: float = 20.0  # Wait for first speech onset
+    asr_speech_max_duration_s: float = 45.0  # Maximum duration after onset
     asr_min_chars: int = 2
 
     # ── LLM settings ───────────────────────────────────────────────────
@@ -63,17 +67,20 @@ class Config:
     tts_sample_rate: int = 24000
 
     # ── Wake word ──────────────────────────────────────────────────────
-    # Wake word is detected server-side via cloud ASR transcript matching.
-    # No local wake-word model is used — the mic is always streamed to the
-    # cloud, and ``_accept_transcript()`` checks for the wake word in the
-    # recognised text.  Once detected, a 30 s grace window keeps the
-    # conversation open without requiring the wake word on every turn.
+    # Wake word is detected server-side via cloud ASR transcript matching
+    # after a local voice-activity gate.  Standby audio is not streamed to
+    # the cloud; ``_accept_transcript()`` checks the wake word in speech.
+    # Once detected, a 30 s grace window keeps the conversation open.
     enable_wake_word: bool = True
     wake_words: str = "皮皮虾"
     wake_word_timeout_s: float = 30.0
     wake_response: str = "我在呢！有什么可以帮你的？"
     feedback_sounds_enabled: bool = True   # Play beeps on state transitions
-    barge_in_sensitivity: float = 0.06     # Mic RMS threshold for interrupting TTS (0-1)
+    # The SDK AEC channel has an idle RMS around 0.08-0.14 on the current
+    # hardware. Keep standby recognition and interruption above that floor.
+    voice_activity_threshold: float = 0.16
+    barge_in_enabled: bool = False
+    barge_in_sensitivity: float = 0.18     # Mic RMS threshold for interrupting TTS (0-1)
 
     # ── Audio ──────────────────────────────────────────────────────────
     # Safe default: auto-detect a unique Reachy full-duplex device. Use the
@@ -90,11 +97,15 @@ class Config:
     media_backend: str = "auto"
 
     # ── Daemon ──────────────────────────────────────────────────────────
-    # "connect" → 连接已有 SDK daemon
-    # "spawn"   → 自动拉起 SDK daemon 子进程
-    daemon_mode: str = "connect"
+    # "auto" → 连接健康 daemon；本机没有 daemon 时才拉起
+    # "connect" → 只连接已有 SDK daemon
+    # "spawn"   → 仅回收本项目 daemon 后拉起
+    daemon_mode: str = "auto"
     daemon_host: str = "reachy-mini.local"
     daemon_port: int = 8000
+    daemon_serial_port: str = ""  # Optional explicit motor-controller serial port
+    daemon_simulation: bool = False  # Simulation must be explicitly opted into
+    daemon_state_file: str = "state/daemon.json"
     auto_wake_up: bool = True      # 启动时自动让机器人站起来
     auto_sleep: bool = True        # 关闭时自动让机器人休眠
 
@@ -114,6 +125,9 @@ class Config:
     location_gpsd_host: str = "127.0.0.1"
     location_gpsd_port: int = 2947
     location_poll_interval_s: float = 2.0   # GPS poll interval
+    # Operator-declared current location. This is text so a known venue or
+    # city can be supplied even when no GPS coordinates are available.
+    manual_location: str = ""
 
     # ── Conversation ───────────────────────────────────────────────────
     language: str = "zh"  # "zh" | "en"
@@ -130,6 +144,7 @@ class Config:
     journal_cache_dir: str = "data/journals"
     memory_top_k: int = 5  # number of journal snippets to retrieve
     journal_relevance_threshold: float = 0.48
+    journal_auto_sync_interval_minutes: int = 30  # 0 = sync only on startup
 
     # ── EZVIZ rear-view camera ────────────────────────────────────────
     ezviz_app_key: str = ""
@@ -186,6 +201,8 @@ _ENV: dict[str, str] = {
     "asr_language": "BAILIAN_ASR_LANGUAGE",
     "asr_vad_silence_ms": "BAILIAN_ASR_VAD_SILENCE_MS",
     "asr_vad_threshold": "BAILIAN_ASR_VAD_THRESHOLD",
+    "asr_initial_silence_timeout_s": "BAILIAN_ASR_INITIAL_SILENCE_TIMEOUT_S",
+    "asr_speech_max_duration_s": "BAILIAN_ASR_SPEECH_MAX_DURATION_S",
     "asr_min_chars": "BAILIAN_ASR_MIN_CHARS",
     "llm_temperature": "BAILIAN_LLM_TEMPERATURE",
     "llm_max_tokens": "BAILIAN_LLM_MAX_TOKENS",
@@ -197,17 +214,24 @@ _ENV: dict[str, str] = {
     "wake_words": "BAILIAN_WAKE_WORDS",
     "wake_word_timeout_s": "BAILIAN_WAKE_WORD_TIMEOUT_S",
     "wake_response": "BAILIAN_WAKE_RESPONSE",
+    "voice_activity_threshold": "REACHY_VOICE_ACTIVITY_THRESHOLD",
+    "barge_in_enabled": "REACHY_BARGE_IN_ENABLED",
+    "barge_in_sensitivity": "REACHY_BARGE_IN_SENSITIVITY",
     "audio_device": "REACHY_AUDIO_DEVICE",
     "audio_input_channel": "REACHY_AUDIO_INPUT_CHANNEL",
     "audio_mic_gain": "REACHY_MIC_GAIN",
     "camera_device": "REACHY_CAMERA_DEVICE",
     "dashboard_port": "REACHY_DASHBOARD_PORT",
     "language": "REACHY_LANGUAGE",
+    "manual_location": "REACHY_MANUAL_LOCATION",
     "session_reset_idle_s": "REACHY_SESSION_RESET_IDLE_S",
     "media_backend": "REACHY_MEDIA_BACKEND",
     "daemon_mode": "REACHY_DAEMON_MODE",
     "daemon_host": "REACHY_DAEMON_HOST",
     "daemon_port": "REACHY_DAEMON_PORT",
+    "daemon_serial_port": "REACHY_DAEMON_SERIAL_PORT",
+    "daemon_simulation": "REACHY_DAEMON_SIMULATION",
+    "daemon_state_file": "REACHY_DAEMON_STATE_FILE",
     "auto_wake_up": "REACHY_AUTO_WAKE_UP",
     "auto_sleep": "REACHY_AUTO_SLEEP",
     "dance_enabled": "REACHY_DANCE_ENABLED",
@@ -258,5 +282,14 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     if camera_raw is not None:
         camera_raw = camera_raw.strip()
         cfg.camera_device = int(camera_raw) if camera_raw.isdigit() else camera_raw
+
+    # A previous deployment shipped this truncated spelling. Normalize it at
+    # the boundary so an old .env cannot route TTS into the wrong HTTP client.
+    if cfg.bailian_tts_model == "qwen3-tts-flash-realtim":
+        logger.warning(
+            "修正旧 TTS 模型拼写 qwen3-tts-flash-realtim -> "
+            "qwen3-tts-flash-realtime"
+        )
+        cfg.bailian_tts_model = "qwen3-tts-flash-realtime"
 
     return cfg

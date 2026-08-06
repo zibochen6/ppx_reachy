@@ -11,6 +11,25 @@ from typing import AsyncIterator, Protocol, runtime_checkable
 import numpy as np
 
 
+# The Dashboard's 0-100 scale maps quadratically to PCM gain. This keeps
+# lower listening levels controllable while 100% reaches +12 dB over 50%.
+MAX_PLAYBACK_GAIN = 8.0
+
+
+def playback_gain_from_percent(percent: int | float) -> float:
+    """Convert a Dashboard volume value to a bounded PCM gain."""
+    normalized = max(0.0, min(100.0, float(percent))) / 100.0
+    return MAX_PLAYBACK_GAIN * normalized * normalized
+
+
+def playback_percent_from_gain(gain: float) -> int:
+    """Convert a PCM gain to the Dashboard's 0-100 scale."""
+    from math import sqrt
+
+    normalized = max(0.0, min(MAX_PLAYBACK_GAIN, float(gain))) / MAX_PLAYBACK_GAIN
+    return round(sqrt(normalized) * 100)
+
+
 @runtime_checkable
 class CameraBackend(Protocol):
     """Abstract camera backend — provides BGR frames and JPEG encoding."""
@@ -88,7 +107,7 @@ class AudioBackend(Protocol):
 
     @property
     def volume(self) -> float:
-        """Current volume gain (0.0 - 3.0)."""
+        """Current playback gain (0.0 - 8.0)."""
         ...
 
     @volume.setter

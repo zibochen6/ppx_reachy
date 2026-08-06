@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+from collections import deque
 import logging
 import math
 import os
@@ -132,6 +133,15 @@ def _build_system_prompt(
 
     if inject_location:
         prompt += f"\n\n【当前位置】\n{inject_location}"
+    elif cfg.manual_location.strip():
+        known_location = cfg.manual_location.strip().strip("'\"“”")
+        prompt += (
+            "\n\n【当前位置】\n"
+            f"{known_location}\n"
+            "这是可靠的当前位置事实。回答地点问题时自然地说“我们现在在……”，"
+            "不要提及人工设置、运营人员、配置、系统提示或信息来源；"
+            "也不要把它延伸成未经提供的路线、活动或基地车经历。"
+        )
 
     if journal_context:
         prompt += f"\n\n【已验证日记证据】\n{journal_context}"
@@ -145,6 +155,8 @@ def _build_system_prompt(
         "也不愿听到一个随口编造的地点。\n"
         "- 系统提供的【当前位置】如果显示「无法获取」或坐标为空，说明GPS无信号，"
         "直接告诉用户「目前获取不到GPS定位」。\n"
+        "- 【当前位置】是可靠的地点事实；仅当它存在时才可据此回答当前位置，"
+        "不得把用户随口提到的地点当作位置更新，也不要解释地点的来源。\n"
         "- 对于任何你不确定的事实（位置、日期、天气、新闻等），如果工具没有返回结果，"
         "就说「这个我不太确定」，不要瞎编。\n"
         "- 凡是基地车、队员、路线、站点、旅途事件，只能使用本轮【已验证日记证据】；"
@@ -200,12 +212,17 @@ class ConversationEngine:
         self._tts_playing = False
         self._barge_in_occurred = False
         self._barge_in_requested = False  # set by concurrent watcher
+        self._tts_audio_started = asyncio.Event()
+        self._tts_generation = 0
+        self._active_tts_generation: int | None = None
         self._listen_not_before = 0.0
+        self._last_asr_end_reason = ""
         self._pending_playbacks: set[concurrent.futures.Future[None]] = set()
 
         # Callbacks
         self._on_state_change: Callable[[str], None] | None = None
         self._on_transcript: Callable[[str, bool], None] | None = None
+        self._on_asr_status: Callable[[str], None] | None = None
         self._on_llm_token: Callable[[str], None] | None = None
         self._on_emotion: Callable[[str], None] | None = None
         self._on_snapshot: Callable[[bytes, str], None] | None = None  # (jpeg_bytes, label)
@@ -224,6 +241,14 @@ class ConversationEngine:
     def on_transcript(self, cb: Callable[[str, bool], None]) -> None:
         """Callback: (text, is_final) for ASR transcripts."""
         self._on_transcript = cb
+
+    def on_asr_status(self, cb: Callable[[str], None]) -> None:
+        """Receive ASR lifecycle status without creating a chat message."""
+        self._on_asr_status = cb
+
+    def _emit_asr_status(self, status: str) -> None:
+        if self._on_asr_status:
+            self._on_asr_status(status)
 
     def on_llm_token(self, cb: Callable[[str], None]) -> None:
         """Callback: streaming LLM tokens."""
@@ -395,14 +420,7 @@ class ConversationEngine:
         # ── 1. Listen ──
         self._set_state("listening")
 
-        try:
-            user_text = await asyncio.wait_for(
-                self._listen_for_speech(),
-                timeout=self.config.asr_turn_timeout_s,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("ASR turn timed out")
-            user_text = ""
+        user_text = await self._listen_for_speech()
 
         if not user_text:
             # During the 30s wake-free window, pause briefly before retrying
@@ -451,10 +469,61 @@ class ConversationEngine:
             logger.info("🎤 [聆听] 等待回声门控... (剩余 %.2fs)", remaining)
         await self._wait_for_listening_gate()
 
-        logger.info("🎤 [聆听] 开始录音，建立 ASR 连接...")
-        return await self._listen_cloud_asr()
+        if self.config.enable_wake_word and time.monotonic() >= self._wake_word_active_until:
+            self._set_state("wake_listening")
+        initial_audio = await self._wait_for_voice_activity()
+        if not initial_audio:
+            return ""
 
-    async def _listen_cloud_asr(self) -> str:
+        self._set_state("listening")
+        logger.info("🎤 [聆听] 检测到语音，建立 ASR 连接...")
+        self._emit_asr_status("检测到语音，正在连接识别服务")
+        return await self._listen_cloud_asr(initial_audio)
+
+    async def _wait_for_voice_activity(self) -> list[bytes]:
+        """Wait locally for speech before opening a cloud ASR session.
+
+        Standby used to keep a Bailian WebSocket open and stream silence.  A
+        short local gate avoids cloud recognition while nobody is speaking and
+        retains up to 500 ms of pre-roll so the first syllable is not lost.
+        """
+        assert self._audio is not None
+        deadline = time.monotonic() + self.config.asr_initial_silence_timeout_s
+        threshold = max(0.01, min(0.95, self.config.voice_activity_threshold))
+        pre_roll: deque[bytes] = deque(maxlen=5)
+        voice_frames = 0
+        capture = self._audio.start_capture().__aiter__()
+        self._emit_asr_status("等待语音活动（未连接云端识别）")
+        try:
+            while time.monotonic() < deadline:
+                remaining = max(0.01, min(0.2, deadline - time.monotonic()))
+                try:
+                    chunk = await asyncio.wait_for(anext(capture), timeout=remaining)
+                except asyncio.TimeoutError:
+                    continue
+                except StopAsyncIteration:
+                    break
+                pre_roll.append(chunk)
+                rms = float(getattr(self._audio, "capture_rms", 0.0) or 0.0)
+                if rms >= threshold:
+                    voice_frames += 1
+                else:
+                    voice_frames = 0
+                if voice_frames >= 2:  # ~200 ms, avoids opening ASR on one spike
+                    logger.info("🎤 [本地 VAD] 检测到语音 RMS=%.4f", rms)
+                    return list(pre_roll)
+        finally:
+            close_capture = getattr(capture, "aclose", None)
+            if close_capture is not None:
+                try:
+                    await close_capture()
+                except Exception:
+                    logger.debug("local voice gate close failed", exc_info=True)
+        self._last_asr_end_reason = "initial_silence_timeout"
+        self._emit_asr_status("未检测到用户开口（未连接云端识别）")
+        return []
+
+    async def _listen_cloud_asr(self, initial_audio: list[bytes] | None = None) -> str:
         """Stream mic audio to Bailian realtime ASR via WebSocket.
 
         Server-side VAD (``turn_detection.server_vad``) detects
@@ -467,6 +536,11 @@ class ConversationEngine:
         assert self._audio is not None
 
         audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
+        for chunk in initial_audio or []:
+            try:
+                audio_queue.put_nowait(chunk)
+            except asyncio.QueueFull:
+                break
         capture_done = asyncio.Event()
         dropped_frames = 0
         speech_start_time: float | None = None
@@ -532,12 +606,55 @@ class ConversationEngine:
 
                 feed_task = asyncio.create_task(_feed_asr())
 
+                results = asr.results().__aiter__()
                 try:
-                    async for result in asr.results():
+                    while True:
+                        if speech_start_time is None:
+                            result_timeout = self.config.asr_initial_silence_timeout_s
+                            timeout_reason = "initial_silence_timeout"
+                        else:
+                            result_timeout = max(
+                                0.0,
+                                self.config.asr_speech_max_duration_s
+                                - (time.monotonic() - speech_start_time),
+                            )
+                            timeout_reason = "speech_max_duration_timeout"
+                        try:
+                            result = await asyncio.wait_for(
+                                anext(results), timeout=result_timeout
+                            )
+                        except asyncio.TimeoutError:
+                            self._last_asr_end_reason = timeout_reason
+                            message = (
+                                "未检测到用户开口"
+                                if timeout_reason == "initial_silence_timeout"
+                                else "未检测到完整语句，请缩短后重新说一次"
+                            )
+                            logger.warning(
+                                "ASR %s (initial=%.1fs, speech_max=%.1fs, "
+                                "queue=%d, dropped=%d)",
+                                timeout_reason,
+                                self.config.asr_initial_silence_timeout_s,
+                                self.config.asr_speech_max_duration_s,
+                                audio_queue.qsize(),
+                                dropped_frames,
+                            )
+                            self._emit_asr_status(message)
+                            break
+                        except StopAsyncIteration:
+                            self._last_asr_end_reason = "result_stream_closed"
+                            self._emit_asr_status("语音识别连接已结束，请重试")
+                            break
+
+                        if result.error:
+                            self._last_asr_end_reason = "asr_error"
+                            self._emit_asr_status("语音识别失败，请重试")
+                            raise RuntimeError(result.error)
                         if result.speech_started:
                             speech_count += 1
                             speech_start_time = time.monotonic()
-                            if self._tts_playing and self._barge_in:
+                            self._emit_asr_status("正在聆听，请继续说完")
+                            if self.config.barge_in_enabled and self._tts_playing and self._barge_in:
                                 logger.info("⏸ [打断] 用户开始说话，停止播放")
                                 self._audio.stop_playback()
                                 self._tts_playing = False
@@ -559,6 +676,7 @@ class ConversationEngine:
                                     dropped_frames,
                                 )
                             final_text = result.text
+                            self._last_asr_end_reason = "completed"
                             if self._on_transcript:
                                 self._on_transcript(result.text, True)
                             break
@@ -582,6 +700,16 @@ class ConversationEngine:
                         "%s",
                         db, speech_count, dropped_frames,
                         "可能是无人说话" if speech_count == 0 else "有语音但未识别出文字",
+                    )
+                else:
+                    logger.info(
+                        "🎤 [ASR] 完整转写 chars=%d speech=%.1fs "
+                        "vad_silence=%dms queue=%d dropped=%d",
+                        len(final_text.strip()),
+                        (time.monotonic() - speech_start_time) if speech_start_time else 0.0,
+                        self.config.asr_vad_silence_ms,
+                        audio_queue.qsize(),
+                        dropped_frames,
                     )
 
                 return final_text.strip()
@@ -773,7 +901,13 @@ class ConversationEngine:
             )
 
         target_date = _extract_target_date(query)
-        results = (
+        search_journey_scope = getattr(self._memory, "search_journey_scope", None)
+        journey_scope = (
+            search_journey_scope(query, k=6)
+            if not target_date and callable(search_journey_scope)
+            else []
+        )
+        results = journey_scope or (
             self._memory.search_by_date(target_date, k=3)
             if target_date
             else self._memory.search(query, k=self.config.memory_top_k)
@@ -794,7 +928,12 @@ class ConversationEngine:
                 memory_store=self._memory,
                 refresh_slugs=candidate_slugs,
             )
-            results = (
+            journey_scope = (
+                search_journey_scope(query, k=6)
+                if not target_date and callable(search_journey_scope)
+                else []
+            )
+            results = journey_scope or (
                 self._memory.search_by_date(target_date, k=3)
                 if target_date
                 else self._memory.search(query, k=self.config.memory_top_k)
@@ -805,7 +944,7 @@ class ConversationEngine:
                 "individually verified cached copy"
             )
 
-        selected = results[:1] if exact_date else results[:2]
+        selected = results[:1] if exact_date else results[:6 if journey_scope else 3]
         health = self._journal_fetcher.health()
         cache_note = (
             f"缓存最后完整校验：{health['last_success_at']}。"
@@ -862,12 +1001,15 @@ class ConversationEngine:
         of TTS output leaking into the mic.
         """
         assert self._audio is not None
-        # capture_rms is 0.0–1.0 (normalized to 32768). 0.02 ≈ loud room tone,
-        # 0.05 ≈ normal speech from ~1m, 0.10 ≈ close/loud speech.
-        threshold = self.config.barge_in_sensitivity  # default 0.035
-        holdoff_s = 0.3  # grace period: ignore first 300ms of TTS (speaker echo)
+        # Do not interpret microphone noise as an interrupt while the LLM is
+        # still thinking. The first actual TTS PCM callback opens this gate.
+        await self._tts_audio_started.wait()
+
+        threshold = max(0.01, min(0.95, self.config.barge_in_sensitivity))
+        holdoff_s = 0.3  # ignore initial speaker echo
 
         start = time.monotonic()
+        loud_frames = 0
         while not self._barge_in_requested:
             try:
                 # Grace period — don't barge-in on the first ~300ms of TTS output
@@ -877,14 +1019,18 @@ class ConversationEngine:
 
                 rms = self._audio.capture_rms
                 if rms > threshold:
-                    self._barge_in_requested = True
-                    logger.info(
-                        "🗣 [打断] 检测到语音 RMS=%.4f (阈值=%.3f) — 停止当前回答",
-                        rms, threshold,
-                    )
-                    self._audio.stop_playback()
-                    self._barge_in_occurred = True
-                    return
+                    loud_frames += 1
+                    if loud_frames >= 6:  # ~300 ms, filters short echo spikes
+                        self._barge_in_requested = True
+                        logger.info(
+                            "🗣 [打断] 检测到持续语音 RMS=%.4f (阈值=%.3f) — 停止当前回答",
+                            rms, threshold,
+                        )
+                        self._audio.stop_playback()
+                        self._barge_in_occurred = True
+                        return
+                else:
+                    loud_frames = 0
             except Exception:
                 pass
             await asyncio.sleep(0.05)
@@ -905,33 +1051,48 @@ class ConversationEngine:
         llm_done_flag = asyncio.Event()
         tts_done_flag = asyncio.Event()
 
-        # Reset barge-in for this turn (barge-in is disabled for now)
+        # Reset barge-in for this turn and monitor the AEC input while TTS is
+        # active.  The watcher stops PCM immediately; the stream checks the
+        # flag before queuing any additional TTS chunks.
         self._barge_in_requested = False
+        self._tts_audio_started.clear()
+        self._tts_generation += 1
+        generation = self._tts_generation
+        self._active_tts_generation = generation
 
         async with self._speaking_scope():
-            # Barge-in watcher disabled — too prone to TTS echo false triggers.
-            # Will re-enable when AEC hardware is properly configured.
-            # barge_watcher = asyncio.create_task(self._watch_barge_in())
+            barge_watcher = (
+                asyncio.create_task(self._watch_barge_in())
+                if self.config.barge_in_enabled
+                else None
+            )
 
             async with BailianLLMClient(self.config) as llm:
                 # TTS worker
                 async def _tts_worker() -> None:
                     tts = BailianTTSClient(
                         self.config,
-                        on_audio=self._queue_tts_audio,
+                        on_audio=lambda pcm, sample_rate: self._queue_tts_audio(
+                            pcm, sample_rate, generation
+                        ),
                         on_done=tts_done_flag.set,
                     )
                     await tts.open()
                     try:
                         while not llm_done_flag.is_set() or not tts_text_queue.empty():
+                            if self._barge_in_requested:
+                                break
                             try:
                                 text = await asyncio.wait_for(
                                     tts_text_queue.get(), timeout=0.2
                                 )
+                                if self._barge_in_requested:
+                                    break
                                 await tts.feed(text)
                             except asyncio.TimeoutError:
                                 continue
-                        await tts.flush()
+                        if not self._barge_in_requested:
+                            await tts.flush()
                     except Exception:
                         logger.exception("TTS worker error")
                         tts_done_flag.set()
@@ -940,16 +1101,11 @@ class ConversationEngine:
 
                 tts_task = asyncio.create_task(_tts_worker())
 
-                try:
+                async def _consume_llm() -> None:
                     token_buf = ""
-
                     async for token in llm.chat_stream(messages):
-                        # Check for barge-in on every token
                         if self._barge_in_requested:
-                            logger.info("⏸ [打断] 取消 LLM 流 — 用户开始说话")
-                            self._audio.stop_playback()
-                            llm_done_flag.set()
-                            break
+                            return
 
                         full_parts.append(token)
                         if self._on_llm_token:
@@ -957,43 +1113,68 @@ class ConversationEngine:
                         self._emit_turn_event("chat_message_delta", delta=token)
 
                         token_buf += token
-                        # Feed sentence chunks to TTS
                         if any(
                             token_buf.rstrip().endswith(p)
                             for p in ("。", "！", "？", ".", "!", "?", "\n")
-                        ):
-                            clean = _TAG_RE.sub("", token_buf.strip())
-                            if clean:
-                                await tts_text_queue.put(clean)
-                            token_buf = ""
-                        elif len(token_buf) >= 40:
+                        ) or len(token_buf) >= 40:
                             clean = _TAG_RE.sub("", token_buf.strip())
                             if clean:
                                 await tts_text_queue.put(clean)
                             token_buf = ""
 
-                    # Flush remaining
-                    if token_buf.strip():
+                    if token_buf.strip() and not self._barge_in_requested:
                         clean = _TAG_RE.sub("", token_buf.strip())
                         if clean:
                             await tts_text_queue.put(clean)
 
-                    llm_done_flag.set()
-                    await tts_task
-
+                llm_task = asyncio.create_task(_consume_llm())
+                try:
+                    if barge_watcher is None:
+                        await llm_task
+                    else:
+                        done, _ = await asyncio.wait(
+                            (llm_task, barge_watcher),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    if (
+                        barge_watcher is not None
+                        and barge_watcher in done
+                        and self._barge_in_requested
+                    ):
+                        logger.info("⏸ [打断] 取消 LLM 流 — 用户开始说话")
+                        self._audio.stop_playback()
+                        llm_task.cancel()
+                        try:
+                            await llm_task
+                        except asyncio.CancelledError:
+                            pass
+                    elif barge_watcher is not None:
+                        await llm_task
                 except Exception:
                     logger.exception("LLM → TTS pipeline error")
+                    if not llm_task.done():
+                        llm_task.cancel()
+                    try:
+                        await llm_task
+                    except asyncio.CancelledError:
+                        pass
+                finally:
                     llm_done_flag.set()
-                    tts_task.cancel()
                     try:
                         await tts_task
                     except asyncio.CancelledError:
                         pass
+                    except Exception:
+                        logger.debug("TTS worker ended during turn cleanup", exc_info=True)
+                    if barge_watcher is not None:
+                        barge_watcher.cancel()
+                        try:
+                            await barge_watcher
+                        except asyncio.CancelledError:
+                            pass
 
-            # Barge-in watcher disabled
-            # barge_watcher.cancel()
-            # try: await barge_watcher
-            # except asyncio.CancelledError: pass
+            if self._active_tts_generation == generation:
+                self._active_tts_generation = None
 
             full_text = "".join(full_parts)
             emotion = _extract_emotion(full_text)
@@ -1021,19 +1202,30 @@ class ConversationEngine:
         except asyncio.CancelledError:
             pass
 
-    def _queue_tts_audio(self, pcm: bytes, sample_rate: int) -> None:
+    def _queue_tts_audio(
+        self, pcm: bytes, sample_rate: int, generation: int | None = None
+    ) -> None:
         """Bridge sync TTS callback (from SDK thread) → async audio playback."""
         if self._audio is None or self._loop is None:
             return
+        if generation is not None and generation != self._active_tts_generation:
+            logger.debug("Dropping late TTS PCM for generation %d", generation)
+            return
+        if generation is not None:
+            self._loop.call_soon_threadsafe(self._tts_audio_started.set)
         future = asyncio.run_coroutine_threadsafe(
-            self._play_tts_audio(pcm, sample_rate), self._loop
+            self._play_tts_audio(pcm, sample_rate, generation), self._loop
         )
         self._pending_playbacks.add(future)
         future.add_done_callback(self._pending_playbacks.discard)
 
-    async def _play_tts_audio(self, pcm: bytes, sample_rate: int) -> None:
+    async def _play_tts_audio(
+        self, pcm: bytes, sample_rate: int, generation: int | None = None
+    ) -> None:
         """Queue PCM for playback."""
         assert self._audio is not None
+        if generation is not None and generation != self._active_tts_generation:
+            return
         self._audio.set_output_sample_rate(sample_rate)
         await self._audio.play(pcm)
 
@@ -1230,6 +1422,12 @@ class ConversationEngine:
             "tts_playing": self._tts_playing,
             "barge_in_occurred": self._barge_in_occurred,
             "wake_word_active": now < self._wake_word_active_until,
+            "asr": {
+                "vad_silence_ms": self.config.asr_vad_silence_ms,
+                "initial_silence_timeout_s": self.config.asr_initial_silence_timeout_s,
+                "speech_max_duration_s": self.config.asr_speech_max_duration_s,
+                "last_end_reason": self._last_asr_end_reason,
+            },
             "conversation_turns": len(self._conversation_history) // 2,
             "location": location,
         }
@@ -1285,6 +1483,9 @@ class ConversationEngine:
 
     async def _tool_get_current_location(self) -> str:
         """Return the real-time GPS position of the vehicle."""
+        manual_location = self.config.manual_location.strip()
+        if manual_location:
+            return f"我们现在在{manual_location.strip(chr(39) + chr(34) + '“”')}。"
         if self._location is None:
             return "定位服务未启动，无法获取位置信息。"
         try:

@@ -24,6 +24,8 @@ from typing import AsyncIterator
 import numpy as np
 import sounddevice as sd
 
+from chaihuo_reachy.backends.interfaces import MAX_PLAYBACK_GAIN
+
 logger = logging.getLogger("chaihuo_reachy.audio")
 
 _REACHY_DEVICE_NAME = "reachy mini audio"
@@ -305,14 +307,13 @@ class DuplexAudioIO:
 
     @property
     def volume(self) -> float:
-        """Current playback volume as gain multiplier (0.0 - 3.0)."""
+        """Current playback volume as gain multiplier (0.0 - 8.0)."""
         return getattr(self, "_volume", 1.5)
 
     @volume.setter
     def volume(self, val: float) -> None:
-        """Set playback volume as PCM gain multiplier (0.0 - 3.0).
-        1.0 = original level, 2.0 = 2x amplified, 3.0 = 3x amplified."""
-        self._volume = max(0.0, min(3.0, float(val)))
+        """Set playback volume as PCM gain multiplier (0.0 - 8.0)."""
+        self._volume = max(0.0, min(MAX_PLAYBACK_GAIN, float(val)))
 
     def play_rms(self) -> float:
         """Smoothed RMS (0..1) of speaker output — for speech-timed animation."""
@@ -466,7 +467,7 @@ class DuplexAudioIO:
 
             if n > 0:
                 s = np.frombuffer(mono, dtype=np.int16).astype(np.float32) / 32768.0
-                # Apply volume gain (0.0-2.0, allowing amplification)
+                # Apply the Dashboard-controlled PCM gain before limiting.
                 vol = getattr(self, "_volume", 1.0)
                 s = s * vol
                 # Soft clip to prevent harsh distortion

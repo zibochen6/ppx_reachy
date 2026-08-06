@@ -3,6 +3,10 @@ from __future__ import annotations
 import pytest
 
 from chaihuo_reachy.audio import AudioDeviceResolutionError, resolve_audio_device
+from chaihuo_reachy.backends.interfaces import (
+    playback_gain_from_percent,
+    playback_percent_from_gain,
+)
 
 
 DEVICES = [
@@ -31,6 +35,14 @@ DEVICES = [
         "default_samplerate": 48000,
     },
 ]
+
+
+def test_dashboard_volume_mapping_preserves_default_and_expands_maximum() -> None:
+    assert playback_gain_from_percent(0) == 0.0
+    assert playback_gain_from_percent(50) == 2.0
+    assert playback_gain_from_percent(100) == 8.0
+    assert playback_percent_from_gain(2.0) == 50
+    assert playback_percent_from_gain(8.0) == 100
 
 
 def test_auto_selects_unique_reachy_duplex_and_rejects_camera_audio() -> None:
@@ -66,4 +78,3 @@ def test_ambiguous_reachy_candidates_fail_with_indexes() -> None:
     ]
     with pytest.raises(AudioDeviceResolutionError, match="ambiguous indexes"):
         resolve_audio_device("auto", devices=truly_ambiguous)
-
