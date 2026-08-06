@@ -241,6 +241,7 @@ _ENV: dict[str, str] = {
     "ezviz_app_secret": "EZVIZ_APP_SECRET",
     "ezviz_device_serial": "EZVIZ_DEVICE_SERIAL",
     "ezviz_channel_no": "EZVIZ_CHANNEL_NO",
+    "journal_auto_sync_interval_minutes": "JOURNAL_AUTO_SYNC_INTERVAL_MINUTES",
 }
 
 

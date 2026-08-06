@@ -1178,22 +1178,30 @@ async def run_dashboard(
 
     asyncio.create_task(_broadcast_audio_level())
 
-    # ── Auto-sync journals on startup (background, non-blocking) ──
+    # ── Auto-sync journals periodically (background, non-blocking) ──
     async def _auto_sync_journals() -> None:
         from chaihuo_reachy.memory import JournalFetcher
-        fetcher = JournalFetcher(
-            listing_url=cfg.journal_url,
-            cache_dir=cfg.journal_cache_dir,
-        )
-        try:
-            results = await fetcher.sync(memory_store=engine._memory)
-            new_count = sum(1 for r in results if r.get("new"))
-            if new_count:
-                print(f"  📝 日记同步: {new_count} 篇新日记已索引 (共 {len(results)} 篇)")
-            else:
-                print(f"  📝 日记: {len(results)} 篇已缓存")
-        except Exception:
-            logger.warning("Journal auto-sync failed on startup", exc_info=True)
+
+        interval = max(0, cfg.journal_auto_sync_interval_minutes) * 60
+        while True:
+            fetcher = JournalFetcher(
+                listing_url=cfg.journal_url,
+                cache_dir=cfg.journal_cache_dir,
+            )
+            try:
+                results = await fetcher.sync(memory_store=engine._memory)
+                new_count = sum(1 for r in results if r.get("new"))
+                if new_count:
+                    print(f"  📝 日记自动同步: {new_count} 篇新日记已索引 (共 {len(results)} 篇)")
+                elif interval > 0:
+                    logger.debug("日记自动同步: 无新内容 (%d 篇)", len(results))
+                else:
+                    print(f"  📝 日记: {len(results)} 篇已缓存")
+            except Exception:
+                logger.warning("Journal auto-sync failed", exc_info=True)
+            if interval <= 0:
+                break  # 0 = one-shot only at startup
+            await asyncio.sleep(interval)
 
     asyncio.create_task(_auto_sync_journals())
 
