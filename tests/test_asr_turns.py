@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Any
 
 import pytest
 
@@ -91,6 +92,11 @@ def _engine_with_fake_asr(monkeypatch, events, *, initial: float = 0.03, maximum
     return engine, asr
 
 
+def _fake_capture() -> Any:
+    """An endless capture iterator, as opened by _listen_for_speech."""
+    return _FakeAudio().start_capture().__aiter__()
+
+
 @pytest.mark.asyncio
 async def test_partial_and_final_transcript_are_committed_without_session_update(monkeypatch) -> None:
     engine, asr = _engine_with_fake_asr(monkeypatch, [
@@ -101,7 +107,7 @@ async def test_partial_and_final_transcript_are_committed_without_session_update
     transcripts: list[tuple[str, bool]] = []
     engine.on_transcript(lambda text, final: transcripts.append((text, final)))
 
-    assert await engine._listen_cloud_asr() == "请介绍一下基地车。"
+    assert await engine._listen_cloud_asr(capture=_fake_capture()) == "请介绍一下基地车。"
     assert transcripts[-1] == ("请介绍一下基地车。", True)
     assert engine._last_asr_end_reason == "completed"
 
@@ -112,7 +118,7 @@ async def test_initial_silence_timeout_is_distinct_from_speech_timeout(monkeypat
     statuses: list[str] = []
     engine.on_asr_status(statuses.append)
 
-    assert await engine._listen_cloud_asr() == ""
+    assert await engine._listen_cloud_asr(capture=_fake_capture()) == ""
     assert asr.finished
     assert engine._last_asr_end_reason == "initial_silence_timeout"
     assert statuses[-1] == "未检测到用户开口"
@@ -124,10 +130,10 @@ async def test_speech_can_exceed_initial_window_but_stops_at_speech_maximum(monk
         (0.0, ASRResult(text="", speech_started=True)),
         (0.02, ASRResult(text="这是一个较长的问题", is_final=True)),
     ], initial=0.01, maximum=0.05)
-    assert await engine._listen_cloud_asr() == "这是一个较长的问题"
+    assert await engine._listen_cloud_asr(capture=_fake_capture()) == "这是一个较长的问题"
 
     timed_out, _asr = _engine_with_fake_asr(monkeypatch, [
         (0.0, ASRResult(text="", speech_started=True)),
     ], initial=0.01, maximum=0.01)
-    assert await timed_out._listen_cloud_asr() == ""
+    assert await timed_out._listen_cloud_asr(capture=_fake_capture()) == ""
     assert timed_out._last_asr_end_reason == "speech_max_duration_timeout"

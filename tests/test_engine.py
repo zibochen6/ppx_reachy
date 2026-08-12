@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 import time
+import wave
+from pathlib import Path
 
 import pytest
 
@@ -24,17 +27,44 @@ def test_manual_location_is_injected_as_natural_location_context() -> None:
 
 
 @pytest.mark.asyncio
-async def test_manual_location_takes_precedence_for_location_queries() -> None:
+async def test_manual_location_is_structured_final_fallback() -> None:
     engine = ConversationEngine(Config(manual_location="北京市朝阳区三里屯"))
-    assert await engine._tool_get_current_location() == (
-        "我们现在在北京市朝阳区三里屯。"
-    )
+    result = await engine._tool_get_current_location()
+    assert result["place"] == "北京市朝阳区三里屯"
+    assert result["source"] == "configured_fallback"
+    assert result["precision"] == "city"
 
 
-def test_bare_wake_word_returns_sentinel_and_opens_followup_window() -> None:
-    engine = ConversationEngine(Config())
+def test_cloud_engine_bare_wake_word_returns_sentinel_and_opens_followup_window() -> (
+    None
+):
+    engine = ConversationEngine(Config(wake_engine="cloud"))
     assert engine._accept_transcript("皮皮虾") == _WAKE_ONLY
     assert engine._accept_transcript("今天天气怎么样") == "今天天气怎么样"
+
+
+def test_wake_word_in_sentence_middle_or_end_is_not_stripped() -> None:
+    # A wake word inside the user's own sentence must not truncate the
+    # instruction: "跳个正常点的舞蹈。皮皮虾。" previously degraded to a
+    # bare-wake-word canned response and the request was lost.
+    engine = ConversationEngine(Config(wake_engine="cloud"))
+    assert engine._accept_transcript("皮皮虾") == _WAKE_ONLY  # open the window
+    assert engine._accept_transcript("跳个正常点的舞蹈。皮皮虾。") == (
+        "跳个正常点的舞蹈。皮皮虾。"
+    )
+    assert engine._accept_transcript("我不吃皮皮虾") == "我不吃皮皮虾"
+    # Leading wake word is still stripped correctly.
+    assert engine._accept_transcript("皮皮虾今天天气怎么样") == "今天天气怎么样"
+
+
+def test_local_engine_only_treats_bare_wake_word_as_wake() -> None:
+    # With the local KWS engine, a transcript that is exactly the wake word
+    # still gets the canned response; anything else is a real instruction
+    # (no substring stripping — KWS already gated the turn).
+    engine = ConversationEngine(Config(wake_engine="local"))
+    assert engine._accept_transcript("皮皮虾") == _WAKE_ONLY
+    assert engine._accept_transcript("今天天气怎么样") == "今天天气怎么样"
+    assert engine._accept_transcript("我不吃皮皮虾") == "我不吃皮皮虾"
 
 
 @pytest.mark.asyncio
@@ -81,6 +111,33 @@ async def test_listening_gate_waits_while_tts_is_active() -> None:
     await release_task
 
 
+def test_runtime_status_distinguishes_speech_from_other_speaker_audio() -> None:
+    class Audio:
+        resolved_info: dict[str, object] = {}
+        is_playing = True
+
+        @staticmethod
+        def play_rms() -> float:
+            return 0.0
+
+    class Motion:
+        is_talk_shaking = True
+
+    engine = ConversationEngine(
+        Config(),
+        audio_backend=Audio(),
+        motion=Motion(),  # type: ignore[arg-type]
+    )
+    status = engine.runtime_status()
+    assert status["speaker_playing"] is True
+    assert status["speech_audio_playing"] is False
+
+    engine._speech_pcm_active = True
+    status = engine.runtime_status()
+    assert status["speech_audio_playing"] is True
+    assert status["talk_motion_active"] is True
+
+
 class _VoiceGateAudio:
     def __init__(self, levels: list[float]) -> None:
         self.levels = iter(levels)
@@ -102,7 +159,7 @@ async def test_standby_waits_for_local_voice_before_opening_cloud_asr() -> None:
     )
     received: list[list[bytes]] = []
 
-    async def fake_asr(initial_audio=None):
+    async def fake_asr(capture, initial_audio=None):
         received.append(initial_audio or [])
         return "皮皮虾你好"
 
@@ -181,15 +238,17 @@ class ExactDateMemory:
 
     def search_by_date(self, date_str: str, k: int = 3) -> list[dict]:
         assert date_str == self.target_date
-        return [{
-            "slug": "exact-date",
-            "title": f"基地车日记 {date_str}",
-            "date": date_str,
-            "source_url": "https://example.test/exact-date",
-            "source_updated_at": f"{date_str}T16:54:40Z",
-            "content": "这是已经完整下载并验证过的日记正文。" * 20,
-            "score": 1.0,
-        }]
+        return [
+            {
+                "slug": "exact-date",
+                "title": f"基地车日记 {date_str}",
+                "date": date_str,
+                "source_url": "https://example.test/exact-date",
+                "source_updated_at": f"{date_str}T16:54:40Z",
+                "content": "这是已经完整下载并验证过的日记正文。" * 20,
+                "score": 1.0,
+            }
+        ]
 
 
 class JourneyScopeMemory:
@@ -219,6 +278,14 @@ class JourneyScopeMemory:
 
     def search_by_date(self, _date: str, k: int = 3) -> list[dict]:
         return self.entries[:k]
+
+
+class JourneyOverviewMemory(JourneyScopeMemory):
+    def search_journey_overview(self, k: int = 80) -> list[dict]:
+        return self.entries[:k]
+
+    def format_journey_overview(self) -> str:
+        return "按已验证日记，我们走过山西临汾和太原等站点。"
 
 
 @pytest.mark.asyncio
@@ -258,8 +325,48 @@ async def test_journey_scope_context_includes_all_verified_route_days() -> None:
 
     assert all(title in context for title in ("山西启程", "临汾交流", "太原活动"))
     assert [source["slug"] for source in engine._current_sources] == [
-        "start", "middle", "end",
+        "start",
+        "middle",
+        "end",
     ]
+
+
+@pytest.mark.asyncio
+async def test_full_journey_overview_is_historical_and_includes_all_titles() -> None:
+    engine = ConversationEngine(Config())
+    engine._memory = JourneyOverviewMemory()  # type: ignore[assignment]
+    engine._journal_fetcher = CompleteFetcher()  # type: ignore[assignment]
+
+    context = await engine._verified_journal_context("我们都去过什么地方？")
+
+    assert "不是当前位置查询" in context
+    assert "不要回答‘我们现在在哪里’" in context
+    assert all(title in context for title in ("山西启程", "临汾交流", "太原活动"))
+
+
+@pytest.mark.asyncio
+async def test_full_journey_question_never_calls_live_location_tool() -> None:
+    engine = ConversationEngine(Config(manual_location="北京市"))
+    engine._memory = JourneyOverviewMemory()  # type: ignore[assignment]
+    engine._journal_fetcher = CompleteFetcher()  # type: ignore[assignment]
+    engine._set_session_location("北京市清华大学")
+    prompts: list[list[dict]] = []
+
+    async def summarize(messages: list[dict]) -> tuple[str, str]:
+        prompts.append(messages)
+        return "我们走过山西临汾和太原等站点。", ""
+
+    async def forbidden_location_tool(_messages: list[dict]) -> list[dict]:
+        raise AssertionError("historical route question must not call live location")
+
+    engine._think_text_only = summarize  # type: ignore[method-assign]
+    engine._prepare_location_tool_messages = forbidden_location_tool  # type: ignore[method-assign]
+
+    result = await engine.process_text("我们都去过什么地方？")
+
+    assert result["intent"] == "journey_recall"
+    assert result["reply"] == "按已验证日记，我们走过山西临汾和太原等站点。"
+    assert prompts == []
 
 
 def test_relative_journal_date_guard_corrects_neighboring_date() -> None:
@@ -319,3 +426,451 @@ async def test_general_reply_cannot_claim_camera_view_without_capture() -> None:
 
     assert "这轮没有拍照" in result["reply"]
     assert "冰美式" not in result["reply"]
+
+
+# ── Dance backing music ───────────────────────────────────────────────────
+
+
+class _MusicFakeAudio:
+    backend_name = "fake"
+
+    def __init__(self) -> None:
+        self.plays: list[bytes] = []
+        self.output_sr: int | None = None
+        self.capture_rms = 0.0
+        self.stopped = False
+
+    def set_output_sample_rate(self, sr: int) -> None:
+        self.output_sr = sr
+
+    async def play(self, pcm: bytes) -> None:
+        self.plays.append(pcm)
+
+    def stop_playback(self) -> None:
+        self.stopped = True
+
+
+@pytest.mark.asyncio
+async def test_talk_motion_stops_only_after_audible_playback_drains() -> None:
+    class Audio:
+        def __init__(self) -> None:
+            self._playing = False
+            self._drain_at = 0.0
+
+        async def play(self, _pcm: bytes) -> None:
+            self._playing = True
+
+        def set_output_sample_rate(self, _sr: int) -> None:
+            pass
+
+        def mark_playback_done(self) -> None:
+            self._drain_at = time.monotonic() + 0.08
+
+        @property
+        def is_playing(self) -> bool:
+            if self._playing and time.monotonic() >= self._drain_at > 0:
+                self._playing = False
+            return self._playing
+
+        async def start_capture(self):
+            while True:
+                await asyncio.sleep(1)
+                yield b""
+
+    class Motion:
+        def __init__(self) -> None:
+            self.active = False
+            self.started_at = 0.0
+            self.stopped_at = 0.0
+
+        def start_talk_motion(self) -> None:
+            self.active = True
+            self.started_at = time.monotonic()
+
+        def stop_talk_motion(self, *, immediate: bool = False) -> None:
+            self.active = False
+            self.stopped_at = time.monotonic()
+
+    audio = Audio()
+    motion = Motion()
+    engine = ConversationEngine(
+        Config(wobbling_enabled=True),
+        audio_backend=audio,  # type: ignore[arg-type]
+        motion=motion,  # type: ignore[arg-type]
+    )
+
+    async with engine._speaking_scope():
+        pcm = b"\x00\x10" * 1600
+        await engine._play_tts_audio(pcm, 16000)
+        assert motion.active
+
+    assert not motion.active
+    assert motion.stopped_at >= audio._drain_at
+
+
+def test_speaker_observer_only_forwards_conversational_audio() -> None:
+    class Motion:
+        def __init__(self) -> None:
+            self.blocks: list[tuple[bytes, int]] = []
+
+        def feed_talk_audio(self, pcm: bytes, sample_rate: int) -> None:
+            self.blocks.append((pcm, sample_rate))
+
+    motion = Motion()
+    engine = ConversationEngine(Config(wobbling_enabled=True), motion=motion)  # type: ignore[arg-type]
+    engine._on_speaker_pcm(b"prompt", 16_000)
+    assert motion.blocks == []
+
+    engine._speech_pcm_active = True
+    engine._on_speaker_pcm(b"speech", 16_000)
+    assert motion.blocks == [(b"speech", 16_000)]
+
+    engine._dance_loop_active = True
+    engine._on_speaker_pcm(b"music", 48_000)
+    assert motion.blocks == [(b"speech", 16_000)]
+
+
+def _make_wav(path: Path, sr: int = 16000, seconds: float = 0.4) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        frames = b"".join(struct.pack("<h", 0) for _ in range(int(sr * seconds)))
+        wf.writeframes(frames)
+
+
+@pytest.mark.asyncio
+async def test_play_dance_music_loops_until_cancelled(tmp_path) -> None:
+    _make_wav(tmp_path / "happy.wav", sr=16000, seconds=0.4)
+    audio = _MusicFakeAudio()
+    engine = ConversationEngine(
+        Config(dance_music_dir=str(tmp_path)),
+        audio_backend=audio,  # type: ignore[arg-type]
+    )
+    task = asyncio.create_task(engine._play_dance_music("happy"))
+    await asyncio.sleep(0.3)  # let a couple of chunks feed
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert len(audio.plays) > 0
+    assert audio.output_sr == 16000  # track sample rate forwarded to audio
+
+
+@pytest.mark.asyncio
+async def test_play_dance_music_silent_without_track(tmp_path) -> None:
+    audio = _MusicFakeAudio()
+    engine = ConversationEngine(
+        Config(dance_music_dir=str(tmp_path)),
+        audio_backend=audio,  # type: ignore[arg-type]
+    )
+    await engine._play_dance_music("happy")  # no music dir → returns quietly
+    assert audio.plays == []
+
+
+@pytest.mark.asyncio
+async def test_tool_dance_plays_music_while_dancing(tmp_path) -> None:
+    _make_wav(tmp_path / "happy.wav", sr=16000, seconds=0.4)
+
+    class _FakeMotion:
+        async def dance(self, style: str, **kwargs) -> dict:
+            await asyncio.sleep(0.2)  # pretend to dance
+            return {"style": style, "skipped": 0, "duration": 0.2}
+
+    audio = _MusicFakeAudio()
+    engine = ConversationEngine(
+        Config(dance_music_dir=str(tmp_path)),
+        audio_backend=audio,  # type: ignore[arg-type]
+        motion=_FakeMotion(),  # type: ignore[arg-type]
+    )
+    reply = await engine._tool_dance("happy")
+    assert "舞蹈" in reply
+    assert audio.plays  # music was fed while dancing
+
+
+# ── Beat-dance loop (infinite dance, voice suspended) ─────────────────
+
+
+class _FakeBeatDance:
+    """Records start/stop; returns tiny PCM for the music feeder."""
+
+    def __init__(self) -> None:
+        self.started = 0
+        self.stopped = 0
+        self._pcm = b"\x00\x00" * 1600  # 0.1s of silence @16k
+
+    def start(self):
+        self.started += 1
+        return (16000, self._pcm)
+
+    def stop(self) -> None:
+        self.stopped += 1
+
+    def status(self) -> dict:
+        return {"active": True, "elapsed": 1.0, "mode_label": "MID", "loop_count": 1}
+
+
+@pytest.mark.asyncio
+async def test_run_turn_suspended_while_dance_loop_active() -> None:
+    class _CountingAudio(_MusicFakeAudio):
+        def __init__(self) -> None:
+            super().__init__()
+            self.listen_calls = 0
+
+    audio = _CountingAudio()
+    engine = ConversationEngine(
+        Config(),
+        audio_backend=audio,  # type: ignore[arg-type]
+        beat_dance=_FakeBeatDance(),  # type: ignore[arg-type]
+    )
+    engine._dance_loop_active = True
+    # _run_turn must return quickly without listening while dancing,
+    # and re-assert the dancing state (an interrupted turn's finally
+    # would otherwise flip the dashboard back to idle).
+    await asyncio.wait_for(engine._run_turn(), timeout=1.0)
+    assert engine._state == "dancing"
+
+
+@pytest.mark.asyncio
+async def test_process_text_blocked_while_dance_loop_active() -> None:
+    engine = ConversationEngine(Config(), beat_dance=_FakeBeatDance())  # type: ignore[arg-type]
+    engine._dance_loop_active = True
+    result = await engine.process_text("你好")
+    assert "跳舞" in result["reply"]
+
+
+@pytest.mark.asyncio
+async def test_start_stop_beat_dance() -> None:
+    audio = _MusicFakeAudio()
+    beat = _FakeBeatDance()
+    engine = ConversationEngine(
+        Config(),
+        audio_backend=audio,  # type: ignore[arg-type]
+        beat_dance=beat,  # type: ignore[arg-type]
+    )
+    reply = await engine.start_beat_dance()
+    assert "开始跳舞" in reply
+    assert engine._dance_loop_active
+    assert beat.started == 1
+    await asyncio.sleep(0.05)  # let the music feeder task run a beat
+    assert audio.plays  # music chunks fed to the speaker
+    # idempotent second start
+    reply2 = await engine.start_beat_dance()
+    assert "已经在跳" in reply2
+
+    reply3 = await engine.stop_beat_dance()
+    assert "停啦" in reply3
+    assert not engine._dance_loop_active
+    assert beat.stopped == 1
+    assert audio.stopped  # playback buffer cleared
+
+
+@pytest.mark.asyncio
+async def test_start_beat_dance_without_controller() -> None:
+    engine = ConversationEngine(Config())
+    reply = await engine.start_beat_dance()
+    assert "未启用" in reply
+    assert not engine._dance_loop_active
+
+
+@pytest.mark.asyncio
+async def test_start_beat_dance_invalidates_inflight_tts() -> None:
+    audio = _MusicFakeAudio()
+    engine = ConversationEngine(
+        Config(),
+        audio_backend=audio,  # type: ignore[arg-type]
+        beat_dance=_FakeBeatDance(),  # type: ignore[arg-type]
+    )
+    engine._tts_generation = 5
+    engine._active_tts_generation = 5
+    engine._tts_playing = True  # a reply is mid-flight when dance is clicked
+    reply = await engine.start_beat_dance()
+    assert "开始跳舞" in reply
+    assert engine._active_tts_generation == 6  # in-flight TTS invalidated
+    assert audio.stopped  # playback buffer flushed before music starts
+    # Late chunks — both the old generation and the current one — must not
+    # interleave with the music while the dance owns the buffer.
+    await engine._play_tts_audio(b"old-gen", 16000, generation=5)
+    await engine._play_tts_audio(b"fresh", 16000, generation=6)
+    assert not any(b"old-gen" in p for p in audio.plays)
+    assert not any(b"fresh" in p for p in audio.plays)
+    # After the dance stops, speech playback resumes for the current generation.
+    await engine.stop_beat_dance()
+    await engine._play_tts_audio(b"after-stop", 16000, generation=6)
+    assert any(b"after-stop" in p for p in audio.plays)
+
+
+@pytest.mark.asyncio
+async def test_queue_tts_audio_dropped_while_dancing() -> None:
+    audio = _MusicFakeAudio()
+    engine = ConversationEngine(
+        Config(),
+        audio_backend=audio,  # type: ignore[arg-type]
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._dance_loop_active = True
+    # generation=None is the _speak_reply/_speak_wake_response path — the
+    # generation bump cannot reach it, so the funnel guard must.
+    engine._queue_tts_audio(b"no-gen", 16000, generation=None)
+    await asyncio.sleep(0.02)
+    assert audio.plays == []
+
+
+@pytest.mark.asyncio
+async def test_barge_in_does_not_kill_music_while_dancing() -> None:
+    class Audio:
+        def __init__(self) -> None:
+            self.values = iter([0.1] * 12)
+            self.stopped = False
+
+        @property
+        def capture_rms(self):
+            return next(self.values, 0.1)
+
+        def stop_playback(self):
+            self.stopped = True
+
+    audio = Audio()
+    engine = ConversationEngine(
+        Config(barge_in_enabled=True, barge_in_sensitivity=0.06),
+        audio_backend=audio,  # type: ignore[arg-type]
+    )
+    engine._tts_audio_started.set()
+    engine._dance_loop_active = True
+    # Loud speech while dancing: the watcher exits without stopping the music.
+    await engine._watch_barge_in()
+    assert not engine._barge_in_requested
+    assert not audio.stopped
+
+
+@pytest.mark.asyncio
+async def test_speaking_paths_skipped_while_dancing() -> None:
+    audio = _MusicFakeAudio()
+    engine = ConversationEngine(
+        Config(),
+        audio_backend=audio,  # type: ignore[arg-type]
+    )
+    engine._dance_loop_active = True
+    # No LLM/TTS client is instantiated: the gate fires before any I/O.
+    text, emotion = await engine._think_and_speak([])
+    assert text == "" and emotion == ""
+    await engine._speak_reply("你好")
+    await engine._speak_wake_response()
+    await engine._speak_greeting()
+    assert audio.plays == []
+
+
+@pytest.mark.asyncio
+async def test_playback_drain_skips_is_playing_while_dancing() -> None:
+    class _FullAudio(_MusicFakeAudio):
+        @property
+        def is_playing(self) -> bool:
+            return True  # music keeps the buffer topped for the whole dance
+
+    audio = _FullAudio()
+    engine = ConversationEngine(
+        Config(),
+        audio_backend=audio,  # type: ignore[arg-type]
+    )
+    engine._dance_loop_active = True
+    # The interrupted turn's _speaking_scope drain must not hang on the music.
+    await asyncio.wait_for(engine._wait_for_playback_drain(), timeout=0.5)
+
+
+# ── Journal-evidence flexibility (科普/常识不拒绝) ─────────────────────
+
+
+def test_journal_evidence_terms() -> None:
+    from chaihuo_reachy.engine import _requires_journal_evidence
+
+    assert _requires_journal_evidence("基地车上一共有多少名队员？")
+    assert _requires_journal_evidence("你记不记得我们昨天去了哪里？")
+    assert not _requires_journal_evidence("科普一下什么是人工智能？")
+    assert not _requires_journal_evidence("城市为什么会有堵车现象？")
+
+
+@pytest.mark.asyncio
+async def test_journal_without_evidence_still_refuses_base_car_facts() -> None:
+    engine = ConversationEngine(Config())
+    engine._memory = EmptyJournalMemory()  # type: ignore[assignment]
+    engine._journal_fetcher = CompleteFetcher()  # type: ignore[assignment]
+    result = await engine.process_text("基地车上一共有多少名队员？")
+    assert result["reply"] == _JOURNAL_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_journal_without_evidence_falls_back_to_general_answer() -> None:
+    class _EchoLLMEngine(ConversationEngine):
+        async def _think_text_only(self, messages, **kwargs):
+            # 如果 system prompt 包含降级提示且不是拒绝，说明走了常识回答
+            sys_prompt = messages[0]["content"]
+            assert "未能从基地车日记检索到相关记录" in sys_prompt
+            return "科普回答：人工智能是……", ""
+
+    engine = _EchoLLMEngine(Config())
+    engine._memory = EmptyJournalMemory()  # type: ignore[assignment]
+    engine._journal_fetcher = CompleteFetcher()  # type: ignore[assignment]
+    # "昨天" 触发日记意图但问题不是基地车事实 → 降级常识回答
+    result = await engine.process_text("昨天我在路上看到一只猫，它为什么一直跟着我？")
+    assert "科普回答" in result["reply"]
+
+
+@pytest.mark.asyncio
+async def test_missing_journey_evidence_gets_natural_gap_not_hallucination() -> None:
+    class _GapEngine(ConversationEngine):
+        async def _think_text_only(self, messages, **kwargs):
+            prompt = messages[0]["content"]
+            assert "未能从基地车日记检索到相关记录" in prompt
+            assert "其他高校" in prompt
+            return (
+                "日记里暂时没有我们在清华发生过什么的记录。"
+                "你刚告诉我的当前位置可以单独记住，但我不能把它编成过去的经历。",
+                "",
+            )
+
+    engine = _GapEngine(Config(bailian_api_key="test"))
+    engine._memory = EmptyJournalMemory()  # type: ignore[assignment]
+    engine._journal_fetcher = CompleteFetcher()  # type: ignore[assignment]
+    result = await engine.process_text("我们在清华大学有什么故事")
+
+    assert result["intent"] == "journey_recall"
+    assert "暂时没有" in result["reply"]
+    assert "过去的经历" in result["reply"]
+
+
+@pytest.mark.asyncio
+async def test_location_declaration_updates_only_current_session() -> None:
+    engine = ConversationEngine(Config())
+    result = await engine.process_text("我们现在在北京清华大学")
+    assert result["intent"] == "location_update"
+    assert "北京清华大学" in result["reply"]
+    assert engine._session_location is not None
+
+    engine.clear_conversation()
+    assert engine._session_location is None
+
+
+@pytest.mark.asyncio
+async def test_chaihuo_introduction_uses_dedicated_official_knowledge() -> None:
+    class _OrgEngine(ConversationEngine):
+        async def _think_text_only(self, messages, **kwargs):
+            prompt = messages[0]["content"]
+            assert "【柴火创客官方知识】" in prompt
+            assert "成立于 2011 年" in prompt
+            assert "基地车是柴火创客发起" in prompt
+            return "柴火创客成立于2011年，基地车是我们发起的移动AI实验室。", ""
+
+    engine = _OrgEngine(Config())
+    result = await engine.process_text("介绍一下柴火创客")
+
+    assert result["intent"] == "org_knowledge"
+    assert "2011" in result["reply"]
+    assert {source["type"] for source in result["sources"]} == {"organization"}
+
+
+def test_conversation_defaults_are_twenty_turns_and_thirty_minutes() -> None:
+    cfg = Config()
+    assert cfg.max_history_turns == 20
+    assert cfg.session_reset_idle_s == 1800.0

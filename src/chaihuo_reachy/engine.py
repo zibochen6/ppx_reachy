@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 from collections import deque
+from datetime import datetime, timezone
+import json
 import logging
 import math
 import os
@@ -23,6 +25,8 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+import numpy as np
 
 from chaihuo_reachy.bailian import (
     ASRResult,
@@ -33,7 +37,13 @@ from chaihuo_reachy.bailian import (
 )
 from chaihuo_reachy.camera import visual_quality_issue
 from chaihuo_reachy.config import Config
-from chaihuo_reachy.intent import IntentDecision, TurnIntent, classify_intent
+from chaihuo_reachy.intent import (
+    IntentDecision,
+    TurnIntent,
+    classify_intent,
+    extract_location_update,
+    is_journey_overview_query,
+)
 from chaihuo_reachy.location import LocationService, create_location_service
 from chaihuo_reachy.memory import JournalFetcher
 from chaihuo_reachy.memory.store import MemoryStore
@@ -44,15 +54,63 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("chaihuo_reachy.engine")
 
-_JOURNAL_UNKNOWN = "这件事我在基地车日记里没有找到可靠记录，所以我不知道。"
+_JOURNAL_UNKNOWN = (
+    "基地车日记暂时没有记录到这一段，我不能把别处的内容当成我们的经历。"
+    "你可以告诉我更具体的地点或日期，我再帮你查一次。"
+)
+
+_LOCATION_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "get_current_location",
+        "description": (
+            "读取基地车当前定位。精确坐标优先；只有公网IP时只返回城市级位置。"
+            "不得根据聊天内容猜测工具未返回的街道、校园或建筑。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "refresh": {
+                    "type": "boolean",
+                    "description": "是否跳过定位缓存并立即刷新",
+                    "default": False,
+                }
+            },
+            "additionalProperties": False,
+        },
+    },
+}
+
+# 明确要求"基地车事实证据"的指代词：含这些词的检索失败才拒绝回答；
+# 否则（科普/常识问题误入日记检索）降级给 LLM 正常回答。
+_JOURNAL_EVIDENCE_TERMS = (
+    "基地车",
+    "日记",
+    "咱们",
+    "我们",
+    "记不记得",
+    "还记得",
+    "回忆",
+    "旅途",
+    "旅程",
+    "哪一站",
+    "队友",
+    "领队",
+    "车上",
+)
+
+
+def _requires_journal_evidence(text: str) -> bool:
+    return any(term in text for term in _JOURNAL_EVIDENCE_TERMS)
+
 
 # Common ASR homophone corrections (Chinese: same sound, wrong character)
 _ASR_CORRECTIONS: dict[str, str] = {
-    "跳个五": "跳个舞",   # 舞/五 both wǔ
-    "跳歌舞": "跳个舞",   # segment error
+    "跳个五": "跳个舞",  # 舞/五 both wǔ
+    "跳歌舞": "跳个舞",  # segment error
     "跳个无": "跳个舞",
     "跳个午": "跳个舞",
-    "个五": "跳个舞",     # VAD missed first char "跳"
+    "个五": "跳个舞",  # VAD missed first char "跳"
     "个舞": "跳个舞",
     "跳五": "跳舞",
     "调个舞": "跳个舞",
@@ -77,15 +135,30 @@ _SHORT_ACKS = {
 # Single-character utterances and common ASR noise that should be
 # silently ignored (no LLM, no TTS, no canned response).
 _NOISE_WORDS = {
-    "嗯", "哦", "好", "对", "行", "嘘", "嘿", "啊", "呀",
-    "呵", "哎", "喂", "呃", "哈", "嘻", "哟", "噢", "啧",
-    "嘿咻", "好嘞",
+    "嗯",
+    "哦",
+    "好",
+    "对",
+    "行",
+    "嘘",
+    "嘿",
+    "啊",
+    "呀",
+    "呵",
+    "哎",
+    "喂",
+    "呃",
+    "哈",
+    "嘻",
+    "哟",
+    "噢",
+    "啧",
+    "嘿咻",
+    "好嘞",
 }
 
 # Regex: pure-noise transcript (single char or noise word, optional punct)
-_NOISE_RE = re.compile(
-    r"^[" + re.escape("，。！？!?、～~…") + r"]*$"
-)
+_NOISE_RE = re.compile(r"^[" + re.escape("，。！？!?、～~…") + r"]*$")
 _UNGROUNDED_VISUAL_CLAIM_RE = re.compile(
     r"(?:刚(?:刚)?拍(?:到|了)|镜头(?:里|中)|画面(?:里|中|显示)|"
     r"照片(?:里|中)|摄像头(?:里|中|拍到|显示)|"
@@ -112,11 +185,13 @@ _LANGUAGE_LOCK = {
     ),
 }
 
+
 def _build_system_prompt(
     cfg: Config,
     journal_context: str = "",
     *,
     inject_location: str = "",
+    include_location: bool = True,
 ) -> str:
     """Build the full prompt from verified program-selected context."""
     from datetime import date, timedelta
@@ -131,9 +206,9 @@ def _build_system_prompt(
         f"用户提到'昨天''今天'等时间词时请以以上日期为准。"
     )
 
-    if inject_location:
+    if include_location and inject_location:
         prompt += f"\n\n【当前位置】\n{inject_location}"
-    elif cfg.manual_location.strip():
+    elif include_location and cfg.manual_location.strip():
         known_location = cfg.manual_location.strip().strip("'\"“”")
         prompt += (
             "\n\n【当前位置】\n"
@@ -155,13 +230,14 @@ def _build_system_prompt(
         "也不愿听到一个随口编造的地点。\n"
         "- 系统提供的【当前位置】如果显示「无法获取」或坐标为空，说明GPS无信号，"
         "直接告诉用户「目前获取不到GPS定位」。\n"
-        "- 【当前位置】是可靠的地点事实；仅当它存在时才可据此回答当前位置，"
-        "不得把用户随口提到的地点当作位置更新，也不要解释地点的来源。\n"
+        "- 【当前位置】或 get_current_location 工具结果是可靠地点事实；"
+        "城市级IP定位只能说省市，不能扩写具体校园、街道或建筑。\n"
         "- 对于任何你不确定的事实（位置、日期、天气、新闻等），如果工具没有返回结果，"
         "就说「这个我不太确定」，不要瞎编。\n"
-        "- 凡是基地车、队员、路线、站点、旅途事件，只能使用本轮【已验证日记证据】；"
-        "历史对话和常识都不是证据。\n"
-        f"- 日记证据为空或不能支持问题时，只能回答：{_JOURNAL_UNKNOWN}\n"
+        "- 凡是基地车亲历、队员、路线、站点和旅途事件，只能使用本轮【已验证日记证据】；"
+        "组织背景和常识都不能冒充旅途证据。\n"
+        "- 日记证据只能支持一部分时，先回答已确认部分，再准确说明缺口；"
+        f"完全没有相关证据时可回答：{_JOURNAL_UNKNOWN}\n"
         "- 当前画面只能依据本轮刚拍摄且质量合格的照片；不要推断人物身份、地点或不可见信息。\n"
         "- 本轮没有提供【本轮实时画面】时，严禁声称「刚拍到」「镜头里」「画面中」有什么。"
     )
@@ -188,13 +264,18 @@ class ConversationEngine:
         audio_backend: AudioBackend | None = None,
         camera_backend: CameraBackend | None = None,
         motion: MotionController | None = None,
+        beat_dance: Any | None = None,
     ) -> None:
         self.config = cfg
         self._audio: AudioBackend | None = audio_backend
         self._camera: CameraBackend | None = camera_backend
         self._motion = motion
+        self._beat_dance = beat_dance  # BeatDanceController | None
+        self._dance_loop_active = False
+        self._beat_music_task: asyncio.Task | None = None
         self._memory: MemoryStore | None = None
         self._location: LocationService | None = None
+        self._wake: Any | None = None  # WakeWordDetector (local KWS) or None
         self._task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -203,6 +284,9 @@ class ConversationEngine:
         self._speaking_lock = asyncio.Lock()  # prevents overlapping TTS
         self._language = cfg.language
         self._conversation_history: list[dict[str, str]] = []
+        self._session_location: dict[str, Any] | None = None
+        self._last_topic = ""
+        self._last_evidence_ids: list[str] = []
         self._last_activity = 0.0
         self._turn_lock = asyncio.Lock()
         self._current_turn_id = ""
@@ -210,6 +294,11 @@ class ConversationEngine:
         self._wake_word_active_until = 0.0
         self._barge_in = True
         self._tts_playing = False
+        # True only after conversational PCM has been handed to the playback
+        # path.  Unlike AudioBackend.is_playing, this excludes state-change
+        # chirps and other non-speech sounds.
+        self._speech_pcm_active = False
+        self._playback_observer_registered = False
         self._barge_in_occurred = False
         self._barge_in_requested = False  # set by concurrent watcher
         self._tts_audio_started = asyncio.Event()
@@ -217,6 +306,7 @@ class ConversationEngine:
         self._active_tts_generation: int | None = None
         self._listen_not_before = 0.0
         self._last_asr_end_reason = ""
+        self._silent_timeouts = 0  # consecutive listen timeouts with no mic level
         self._pending_playbacks: set[concurrent.futures.Future[None]] = set()
 
         # Callbacks
@@ -225,7 +315,9 @@ class ConversationEngine:
         self._on_asr_status: Callable[[str], None] | None = None
         self._on_llm_token: Callable[[str], None] | None = None
         self._on_emotion: Callable[[str], None] | None = None
-        self._on_snapshot: Callable[[bytes, str], None] | None = None  # (jpeg_bytes, label)
+        self._on_snapshot: Callable[[bytes, str], None] | None = (
+            None  # (jpeg_bytes, label)
+        )
         self._on_turn_event: Callable[[dict[str, Any]], None] | None = None
         self._camera_snapshot_provider: (
             Callable[[], bytes | None | Awaitable[bytes | None]] | None
@@ -279,8 +371,14 @@ class ConversationEngine:
         return self._current_turn_id
 
     def clear_conversation(self) -> None:
-        self._conversation_history.clear()
+        self._clear_session_state()
         self._last_activity = time.monotonic()
+
+    def _clear_session_state(self) -> None:
+        self._conversation_history.clear()
+        self._session_location = None
+        self._last_topic = ""
+        self._last_evidence_ids = []
 
     def _emit_turn_event(self, event_type: str, **payload: Any) -> None:
         if self._on_turn_event is None:
@@ -305,8 +403,11 @@ class ConversationEngine:
             and self._last_activity
             and now - self._last_activity >= self.config.session_reset_idle_s
         ):
-            logger.info("Conversation idle for %.1fs; resetting context", now - self._last_activity)
-            self._conversation_history.clear()
+            logger.info(
+                "Conversation idle for %.1fs; resetting context",
+                now - self._last_activity,
+            )
+            self._clear_session_state()
         self._current_turn_id = uuid.uuid4().hex
         self._current_sources = []
         self._emit_turn_event(
@@ -328,6 +429,8 @@ class ConversationEngine:
         """Start the engine: open audio, camera, memory, begin conversation."""
         if not self.config.bailian_api_key:
             raise RuntimeError("BAILIAN_API_KEY is required")
+        if self.config.wake_engine == "off":
+            self.config.enable_wake_word = False
         if not self.config.bailian_workspace_id:
             raise RuntimeError("BAILIAN_WORKSPACE_ID is required")
 
@@ -336,14 +439,20 @@ class ConversationEngine:
         # Audio: use injected backend or create from factory
         if self._audio is None:
             from chaihuo_reachy.backends.factory import create_audio_backend
+
             self._audio = create_audio_backend(self.config)
             logger.info("Audio: auto-created %s", self._audio.backend_name)
 
         await self._audio.open()
+        observer_setter = getattr(self._audio, "set_playback_observer", None)
+        if callable(observer_setter):
+            observer_setter(self._on_speaker_pcm)
+            self._playback_observer_registered = True
 
         # Camera: use injected backend or create from factory
         if self._camera is None:
             from chaihuo_reachy.backends.factory import create_camera_backend
+
             self._camera = create_camera_backend(self.config)
             logger.info("Camera: auto-created %s", self._camera.backend_name)
 
@@ -352,10 +461,13 @@ class ConversationEngine:
             self._memory = MemoryStore(
                 persist_dir=self.config.chroma_persist_dir,
                 journal_dir=self.config.journal_cache_dir,
+                use_v3=self.config.journal_index_v3_enabled,
             )
             logger.info("Memory store ready: %d documents", self._memory.count())
         except Exception:
-            logger.warning("Memory store unavailable — journal recall disabled", exc_info=True)
+            logger.warning(
+                "Memory store unavailable — journal recall disabled", exc_info=True
+            )
             self._memory = None
 
         # Location (GPS / IP geolocation)
@@ -364,8 +476,32 @@ class ConversationEngine:
             gpsd_host=self.config.location_gpsd_host,
             gpsd_port=self.config.location_gpsd_port,
             poll_interval_s=self.config.location_poll_interval_s,
+            gps_fresh_s=self.config.location_gps_fresh_s,
+            browser_fresh_s=self.config.location_browser_fresh_s,
+            amap_web_key=self.config.amap_web_key,
+            amap_web_private_key=self.config.amap_web_private_key,
+            amap_timeout_s=self.config.amap_timeout_s,
+            amap_cache_ttl_s=self.config.amap_cache_ttl_s,
         )
         await self._location.start()
+
+        # Local wake word (sherpa-onnx KWS).  Falls back to cloud ASR text
+        # matching when the model is missing or inference is broken — never
+        # leave the device unwakeable.
+        if self.config.enable_wake_word and self.config.wake_engine == "local":
+            from chaihuo_reachy.wake_word import (
+                WakeWordDetector,
+                WakeWordUnavailableError,
+            )
+
+            try:
+                detector = WakeWordDetector(self.config)
+                detector.self_check()
+                self._wake = detector
+                logger.info("唤醒词引擎: 本地 KWS (%s)", self.config.wake_words)
+            except WakeWordUnavailableError as exc:
+                logger.warning("本地唤醒不可用，回退云端唤醒: %s", exc)
+                self.config.wake_engine = "cloud"
 
         self._last_activity = time.monotonic()
         self._task = asyncio.create_task(self._conversation_loop())
@@ -378,15 +514,25 @@ class ConversationEngine:
 
     async def stop(self) -> None:
         """Stop the engine gracefully."""
+        await self.stop_beat_dance()
+        self._speech_pcm_active = False
+        if self._motion is not None:
+            stop_motion = getattr(self._motion, "stop_talk_motion", None)
+            if callable(stop_motion):
+                stop_motion(immediate=True)
         if self._task is not None:
             self._task.cancel()
             try:
-                await asyncio.wait_for(self._task, timeout=5.0)
+                await asyncio.wait_for(self._task, timeout=2.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
         if self._location is not None:
             await self._location.stop()
         if self._audio is not None:
+            observer_setter = getattr(self._audio, "set_playback_observer", None)
+            if callable(observer_setter):
+                observer_setter(None)
+            self._playback_observer_registered = False
             await self._audio.close()
         if self._camera is not None:
             self._camera.close()
@@ -412,6 +558,14 @@ class ConversationEngine:
 
     async def _run_turn(self) -> None:
         """Serialize listening and response with Dashboard text turns."""
+        # Beat-dance loop suspends all voice conversation until stopped.
+        if self._dance_loop_active:
+            # Re-assert "dancing": a turn interrupted by the dance may still
+            # finish its finally and flip the dashboard back to idle.
+            if self._state != "dancing":
+                self._set_state("dancing")
+            await asyncio.sleep(0.2)
+            return
         async with self._turn_lock:
             await self._run_voice_turn()
 
@@ -427,6 +581,7 @@ class ConversationEngine:
             # to avoid hammering the cloud ASR with rapid reconnections.
             if time.monotonic() < self._wake_word_active_until:
                 await asyncio.sleep(1.0)
+            await self._maybe_recover_audio()
             return
 
         logger.info("ASR final: %r", user_text)
@@ -444,17 +599,22 @@ class ConversationEngine:
         # Refresh the wake-free window so the user can continue the
         # conversation without saying the wake word on every turn.
         if self.config.enable_wake_word:
-            self._wake_word_active_until = time.monotonic() + self.config.wake_word_timeout_s
+            self._wake_word_active_until = (
+                time.monotonic() + self.config.wake_word_timeout_s
+            )
 
     # ── ASR: mic → text ────────────────────────────────────────────────
     async def _listen_for_speech(self) -> str:
         """Capture audio and stream to Bailian ASR. Returns final transcript.
 
-        Wake word detection is done server-side: the ASR transcript is
-        checked for the wake word by ``_accept_transcript``.  This keeps the
-        device simple (no local wake-word model) and lets the cloud ASR
-        handle both wake-word spotting and speech recognition in one pass.
+        Wake word is detected locally (sherpa-onnx KWS) before the cloud ASR
+        session is opened; the cloud transcript check in ``_accept_transcript``
+        remains as the ``cloud`` engine fallback.  One duplex capture stream
+        is shared by the wake/VAD gate and the ASR session so no audio is
+        lost between wake-word detection and ASR connection.
         """
+        if self._dance_loop_active:
+            return ""
         assert self._audio is not None
 
         # Never start ASR during thinking or speaking — the LLM/TTS phase
@@ -469,31 +629,97 @@ class ConversationEngine:
             logger.info("🎤 [聆听] 等待回声门控... (剩余 %.2fs)", remaining)
         await self._wait_for_listening_gate()
 
-        if self.config.enable_wake_word and time.monotonic() >= self._wake_word_active_until:
-            self._set_state("wake_listening")
-        initial_audio = await self._wait_for_voice_activity()
-        if not initial_audio:
-            return ""
-
-        self._set_state("listening")
-        logger.info("🎤 [聆听] 检测到语音，建立 ASR 连接...")
-        self._emit_asr_status("检测到语音，正在连接识别服务")
-        return await self._listen_cloud_asr(initial_audio)
-
-    async def _wait_for_voice_activity(self) -> list[bytes]:
-        """Wait locally for speech before opening a cloud ASR session.
-
-        Standby used to keep a Bailian WebSocket open and stream silence.  A
-        short local gate avoids cloud recognition while nobody is speaking and
-        retains up to 500 ms of pre-roll so the first syllable is not lost.
-        """
-        assert self._audio is not None
-        deadline = time.monotonic() + self.config.asr_initial_silence_timeout_s
-        threshold = max(0.01, min(0.95, self.config.voice_activity_threshold))
-        pre_roll: deque[bytes] = deque(maxlen=5)
-        voice_frames = 0
         capture = self._audio.start_capture().__aiter__()
-        self._emit_asr_status("等待语音活动（未连接云端识别）")
+        try:
+            if self._needs_wake_word():
+                self._set_state("wake_listening")
+                pre_roll = await self._wait_for_wake_word(capture)
+                if not pre_roll:
+                    self._last_asr_end_reason = "wake_word_timeout"
+                    return ""
+                # Wake confirmed — refresh the grace window for follow-ups.
+                self._wake_word_active_until = (
+                    time.monotonic() + self.config.wake_word_timeout_s
+                )
+                self._set_state("listening")
+                self._emit_asr_status("检测到唤醒词，正在连接识别服务")
+                return await self._listen_cloud_asr(
+                    capture=capture, initial_audio=pre_roll
+                )
+
+            initial_audio = await self._wait_for_voice_activity(capture)
+            if not initial_audio:
+                return ""
+
+            self._set_state("listening")
+            logger.info("🎤 [聆听] 检测到语音，建立 ASR 连接...")
+            self._emit_asr_status("检测到语音，正在连接识别服务")
+            return await self._listen_cloud_asr(
+                capture=capture, initial_audio=initial_audio
+            )
+        finally:
+            close_capture = getattr(capture, "aclose", None)
+            if close_capture is not None:
+                try:
+                    await close_capture()
+                except Exception:
+                    logger.debug("listen capture close failed", exc_info=True)
+
+    async def _maybe_recover_audio(self) -> None:
+        """Restart the audio backend after consecutive silent timeouts.
+
+        The SDK GStreamer recording pipeline can stall (appsink silently
+        stops delivering samples) while playback keeps working — the engine
+        would then loop through 20 s silent listen timeouts forever.  When
+        samples stop flowing entirely (last sample older than 5 s), restart
+        the backend (pipeline NULL → PLAYING) and try again.
+        """
+        age = getattr(self._audio, "last_sample_age_s", None)
+        if age is not None and age < 5.0:
+            self._silent_timeouts = 0  # samples still flowing — mic is alive
+            return
+        rms = float(getattr(self._audio, "capture_rms", 0.0) or 0.0)
+        if age is None and rms > 0.01:
+            self._silent_timeouts = 0  # no age probe (sounddevice), RMS alive
+            return
+        self._silent_timeouts += 1
+        if self._silent_timeouts < 2:
+            logger.warning(
+                "🎤 麦克风无样本流入 (age=%.1fs, RMS=%.4f)，再观察一轮",
+                age if age is not None else float("inf"),
+                rms,
+            )
+            return
+        self._silent_timeouts = 0
+        logger.warning("🎤 麦克风连续两轮无样本流入，重启音频后端...")
+        if self._audio is not None:
+            try:
+                await self._audio.close()
+                await self._audio.open()
+                logger.info("✅ 音频后端已重启")
+            except Exception:
+                logger.exception("音频后端重启失败")
+
+    def _needs_wake_word(self) -> bool:
+        """True when the local KWS gate must run before the cloud ASR."""
+        return (
+            self.config.enable_wake_word
+            and self.config.wake_engine == "local"
+            and self._wake is not None
+            and time.monotonic() >= self._wake_word_active_until
+        )
+
+    async def _wait_for_wake_word(self, capture: Any) -> list[bytes]:
+        """Run local KWS over the mic stream until the wake word is spoken.
+
+        Returns up to ~1 s of pre-roll audio so the utterance that follows
+        the wake word is preserved for the cloud ASR session.  Returns an
+        empty list on timeout or stream end.
+        """
+        assert self._wake is not None
+        self._emit_asr_status("等待唤醒词…（本地识别）")
+        deadline = time.monotonic() + self.config.wake_listen_timeout_s
+        pre_roll: deque[bytes] = deque(maxlen=10)  # ~1 s @ 100 ms chunks
         try:
             while time.monotonic() < deadline:
                 remaining = max(0.01, min(0.2, deadline - time.monotonic()))
@@ -504,27 +730,67 @@ class ConversationEngine:
                 except StopAsyncIteration:
                     break
                 pre_roll.append(chunk)
-                rms = float(getattr(self._audio, "capture_rms", 0.0) or 0.0)
-                if rms >= threshold:
-                    voice_frames += 1
-                else:
-                    voice_frames = 0
-                if voice_frames >= 2:  # ~200 ms, avoids opening ASR on one spike
-                    logger.info("🎤 [本地 VAD] 检测到语音 RMS=%.4f", rms)
+                if self._wake.hit(chunk):
+                    logger.info("🗣 [唤醒] 本地 KWS 命中，进入聆听")
                     return list(pre_roll)
         finally:
-            close_capture = getattr(capture, "aclose", None)
-            if close_capture is not None:
-                try:
-                    await close_capture()
-                except Exception:
-                    logger.debug("local voice gate close failed", exc_info=True)
+            self._wake.reset()
+        self._emit_asr_status("未检测到唤醒词")
+        return []
+
+    async def _wait_for_voice_activity(self, capture: Any) -> list[bytes]:
+        """Wait locally for speech before opening a cloud ASR session.
+
+        A short local gate avoids cloud recognition while nobody is speaking
+        and retains up to 500 ms of pre-roll so the first syllable is not
+        lost.  Consumes the caller's capture iterator.
+        """
+        assert self._audio is not None
+        deadline = time.monotonic() + self.config.asr_initial_silence_timeout_s
+        threshold = max(0.01, min(0.95, self.config.voice_activity_threshold))
+        pre_roll: deque[bytes] = deque(maxlen=5)
+        voice_frames = 0
+        self._emit_asr_status("等待语音活动（未连接云端识别）")
+        while time.monotonic() < deadline:
+            remaining = max(0.01, min(0.2, deadline - time.monotonic()))
+            try:
+                chunk = await asyncio.wait_for(anext(capture), timeout=remaining)
+            except asyncio.TimeoutError:
+                continue
+            except StopAsyncIteration:
+                break
+            pre_roll.append(chunk)
+            rms = float(getattr(self._audio, "capture_rms", 0.0) or 0.0)
+            if rms >= threshold:
+                voice_frames += 1
+            else:
+                voice_frames = 0
+            if voice_frames >= 2:  # ~200 ms, avoids opening ASR on one spike
+                logger.info("🎤 [本地 VAD] 检测到语音 RMS=%.4f", rms)
+                return list(pre_roll)
         self._last_asr_end_reason = "initial_silence_timeout"
+        rms = float(getattr(self._audio, "capture_rms", 0.0) or 0.0)
+        backend = getattr(self._audio, "backend_name", "?")
+        logger.info(
+            "🎤 [聆听] %.0fs 未检测到语音 (RMS=%.4f, backend=%s)",
+            self.config.asr_initial_silence_timeout_s,
+            rms,
+            backend,
+        )
         self._emit_asr_status("未检测到用户开口（未连接云端识别）")
         return []
 
-    async def _listen_cloud_asr(self, initial_audio: list[bytes] | None = None) -> str:
+    async def _listen_cloud_asr(
+        self,
+        capture: Any,
+        initial_audio: list[bytes] | None = None,
+    ) -> str:
         """Stream mic audio to Bailian realtime ASR via WebSocket.
+
+        ``capture`` is the duplex capture iterator opened by the caller
+        (shared with the local VAD / wake-word gate); audio arriving while
+        the ASR connection is established is buffered in ``audio_queue`` so
+        nothing spoken after the wake word is lost.
 
         Server-side VAD (``turn_detection.server_vad``) detects
         speech-start / speech-stop and the ASR service returns the
@@ -549,8 +815,12 @@ class ConversationEngine:
         _clip_since_last_log = 0
 
         async def _capture() -> None:
-            nonlocal dropped_frames, _last_level_log, _peak_since_last_log, _clip_since_last_log
-            async for chunk in self._audio.start_capture():
+            nonlocal \
+                dropped_frames, \
+                _last_level_log, \
+                _peak_since_last_log, \
+                _clip_since_last_log
+            async for chunk in capture:
                 if capture_done.is_set():
                     break
                 if self._listening_is_blocked():
@@ -568,7 +838,9 @@ class ConversationEngine:
                     db = round(20.0 * math.log10(max(rms, 1e-8)), 1)
                     logger.info(
                         "🎤 [诊断] 电平 %5.1f dBFS | 丢帧 %d | 削波 %d",
-                        db, dropped_frames, _clip_since_last_log,
+                        db,
+                        dropped_frames,
+                        _clip_since_last_log,
                     )
                     _peak_since_last_log = 0.0
                     _clip_since_last_log = 0
@@ -597,7 +869,9 @@ class ConversationEngine:
                 async def _feed_asr() -> None:
                     while not capture_done.is_set():
                         try:
-                            chunk = await asyncio.wait_for(audio_queue.get(), timeout=0.1)
+                            chunk = await asyncio.wait_for(
+                                audio_queue.get(), timeout=0.1
+                            )
                             if self._listening_is_blocked():
                                 continue
                             await asr.send_audio(chunk)
@@ -654,9 +928,14 @@ class ConversationEngine:
                             speech_count += 1
                             speech_start_time = time.monotonic()
                             self._emit_asr_status("正在聆听，请继续说完")
-                            if self.config.barge_in_enabled and self._tts_playing and self._barge_in:
+                            if (
+                                self.config.barge_in_enabled
+                                and self._tts_playing
+                                and self._barge_in
+                            ):
                                 logger.info("⏸ [打断] 用户开始说话，停止播放")
                                 self._audio.stop_playback()
+                                self._stop_talk_motion_immediately()
                                 self._tts_playing = False
                                 self._barge_in_occurred = True
 
@@ -698,15 +977,21 @@ class ConversationEngine:
                         "🎤 [ASR] 无识别结果 | 电平 %5.1f dBFS | "
                         "speech_count=%d | dropped=%d — "
                         "%s",
-                        db, speech_count, dropped_frames,
-                        "可能是无人说话" if speech_count == 0 else "有语音但未识别出文字",
+                        db,
+                        speech_count,
+                        dropped_frames,
+                        "可能是无人说话"
+                        if speech_count == 0
+                        else "有语音但未识别出文字",
                     )
                 else:
                     logger.info(
                         "🎤 [ASR] 完整转写 chars=%d speech=%.1fs "
                         "vad_silence=%dms queue=%d dropped=%d",
                         len(final_text.strip()),
-                        (time.monotonic() - speech_start_time) if speech_start_time else 0.0,
+                        (time.monotonic() - speech_start_time)
+                        if speech_start_time
+                        else 0.0,
                         self.config.asr_vad_silence_ms,
                         audio_queue.qsize(),
                         dropped_frames,
@@ -734,12 +1019,26 @@ class ConversationEngine:
         """Run voice and Dashboard text through one deterministic pipeline."""
         self._begin_turn(text, source=source, client_message_id=client_message_id)
         decision = classify_intent(text)
+        if not self.config.source_router_v2_enabled:
+            if decision.intent == TurnIntent.JOURNEY_RECALL:
+                decision = IntentDecision(TurnIntent.JOURNAL, "V2 source router disabled")
+            elif decision.intent in {TurnIntent.ORG_KNOWLEDGE, TurnIntent.LOCATION_UPDATE}:
+                decision = IntentDecision(TurnIntent.GENERAL, "V2 source router disabled")
+        elif (
+            decision.intent == TurnIntent.LOCATION_UPDATE
+            and not self.config.session_state_v2_enabled
+        ):
+            decision = IntentDecision(TurnIntent.GENERAL, "V2 session state disabled")
         journal_context = ""
         vision_context = ""
-        location_context = ""
+        location_context = self._session_location_context()
+        organization_context = ""
         reply = ""
         emotion = ""
         error: str | None = None
+        journal_denied = False
+        location_tool_required = False
+        journal_intents = {TurnIntent.JOURNAL, TurnIntent.JOURNEY_RECALL}
 
         try:
             if decision.intent == TurnIntent.AMBIGUOUS_CAMERA:
@@ -752,21 +1051,56 @@ class ConversationEngine:
                 self._emit_turn_event("turn_status", status="capturing")
                 reply = await self._tool_capture_rear_view()
                 vision_context = reply
+            elif decision.intent == TurnIntent.LOCATION_UPDATE:
+                place = extract_location_update(text)
+                if not place:
+                    reply = "我没听清具体地点，你可以说“我们现在在某某地方”。"
+                else:
+                    self._set_session_location(place)
+                    location_context = self._session_location_context()
+                    reply = f"记住啦，我们现在在{place}。这个位置只在本次对话里有效。"
             elif decision.intent == TurnIntent.LOCATION:
                 self._emit_turn_event("turn_status", status="retrieving")
-                reply = await self._tool_get_current_location()
-                location_context = reply
-            elif decision.intent == TurnIntent.JOURNAL:
+                location_tool_required = True
+            elif decision.intent in journal_intents:
                 self._emit_turn_event("turn_status", status="retrieving")
                 journal_context = await self._verified_journal_context(text)
-                if not journal_context:
-                    reply = _JOURNAL_UNKNOWN
+                if journal_context and is_journey_overview_query(text):
+                    format_overview = getattr(
+                        self._memory, "format_journey_overview", None
+                    )
+                    if callable(format_overview):
+                        reply = str(format_overview() or "")
+                elif not journal_context:
+                    # Let the model explain the precise evidence gap naturally
+                    # instead of bypassing it with the same canned sentence.
+                    journal_denied = True
+                    if not self.config.bailian_api_key and _requires_journal_evidence(text):
+                        # Offline diagnostics/tests have no generator available;
+                        # keep a truthful fallback without attempting the network.
+                        reply = _JOURNAL_UNKNOWN
+            elif decision.intent == TurnIntent.ORG_KNOWLEDGE:
+                organization_context = self.config.organization_knowledge()
+                if organization_context:
+                    self._current_sources.extend(
+                        [
+                            {
+                                "type": "organization",
+                                "title": "柴火创客官方介绍",
+                                "url": "https://www.chaihuo.org/space/list",
+                            },
+                            {
+                                "type": "organization",
+                                "title": "柴火基地车官网",
+                                "url": "https://mcv.chaihuo.org/",
+                            },
+                        ]
+                    )
             elif decision.intent == TurnIntent.MOTION:
                 reply = await self._execute_deterministic_motion(text)
             elif (
                 decision.intent == TurnIntent.GENERAL
-                and re.sub(r"[\s，。！？!?、～~]+", "", text).lower()
-                in _SHORT_ACKS
+                and re.sub(r"[\s，。！？!?、～~]+", "", text).lower() in _SHORT_ACKS
             ):
                 reply = "嗯嗯，我在呢。你慢慢说～"
 
@@ -775,7 +1109,20 @@ class ConversationEngine:
                     self.config,
                     journal_context,
                     inject_location=location_context,
+                    include_location=not is_journey_overview_query(text),
                 )
+                if journal_denied:
+                    system_prompt += (
+                        "\n\n【提示】本轮未能从基地车日记检索到相关记录。"
+                        "不要拿无关地点、其他高校、组织背景或常识补写我们的经历。"
+                        "请自然说明日记覆盖缺口；如果问题还包含可由常识回答的部分，"
+                        "可以明确区分来源后提供有帮助的信息。"
+                    )
+                if organization_context:
+                    system_prompt += (
+                        f"\n\n【柴火创客官方知识】\n{organization_context}\n"
+                        "回答组织介绍时可以展开；不得把这些背景冒充成具体旅途经历。"
+                    )
                 if vision_context:
                     system_prompt += f"\n\n【本轮实时画面】\n{vision_context}"
                 messages: list[dict[str, str]] = [
@@ -784,13 +1131,16 @@ class ConversationEngine:
                 # Prior assistant replies remain conversational context for
                 # general questions, but protected journal facts are rebuilt
                 # solely from this turn's verified source material.
-                if decision.intent != TurnIntent.JOURNAL:
+                if decision.intent not in journal_intents:
                     messages.extend(self._conversation_history)
                 messages.append({"role": "user", "content": text})
 
+                if location_tool_required:
+                    messages = await self._prepare_location_tool_messages(messages)
+
                 self._set_state("thinking")
                 old_search = self.config.enable_search
-                if decision.intent == TurnIntent.JOURNAL:
+                if decision.intent in journal_intents:
                     self.config.enable_search = False
                 try:
                     if speak and self._audio is not None:
@@ -812,7 +1162,7 @@ class ConversationEngine:
                         "我这轮没有拍照，所以不能假装看见啦。"
                         "想让我看看 Reachy 面前，还是基地车外面？"
                     )
-                elif decision.intent == TurnIntent.JOURNAL and journal_context:
+                elif decision.intent in journal_intents and journal_context:
                     # The model summarizes journal prose, but the calendar
                     # calculation is deterministic.  Guard against it
                     # changing "大前天=7月28日" back into a nearby date.
@@ -826,7 +1176,13 @@ class ConversationEngine:
                 await self._speak_reply(reply)
 
             if reply:
-                self._record_history(text, reply)
+                self._record_history(text, reply, vision_context=vision_context)
+                self._last_topic = decision.intent.value
+                self._last_evidence_ids = [
+                    str(item.get("slug") or item.get("title") or "")
+                    for item in self._current_sources
+                    if item.get("slug") or item.get("title")
+                ]
             self._emit_turn_event(
                 "turn_final",
                 text=reply,
@@ -861,56 +1217,99 @@ class ConversationEngine:
             "turn_id": self._current_turn_id,
         }
 
-    def _record_history(self, user_text: str, reply: str) -> None:
+    def _record_history(
+        self, user_text: str, reply: str, vision_context: str = ""
+    ) -> None:
         self._conversation_history.append({"role": "user", "content": user_text})
+        if vision_context:
+            # Persist the camera observation into the conversation so a
+            # follow-up like "你刚才看到了什么" can reference it even when
+            # the VLM and LLM share the same model/context.
+            self._conversation_history.append(
+                {"role": "assistant", "content": f"【画面记录】{vision_context}"}
+            )
         self._conversation_history.append({"role": "assistant", "content": reply})
         max_messages = self.config.max_history_turns * 2
         if len(self._conversation_history) > max_messages:
             self._conversation_history = self._conversation_history[-max_messages:]
 
-    async def _think_text_only(
-        self, messages: list[dict[str, str]]
-    ) -> tuple[str, str]:
+    async def _think_text_only(self, messages: list[dict[str, str]]) -> tuple[str, str]:
         parts: list[str] = []
         async with BailianLLMClient(self.config) as llm:
-            async for token in llm.chat_stream(messages):
-                parts.append(token)
-                if self._on_llm_token:
-                    self._on_llm_token(token)
-                self._emit_turn_event("chat_message_delta", delta=token)
+            it = llm.chat_stream(messages).__aiter__()
+            try:
+                while True:
+                    try:
+                        token = await asyncio.wait_for(anext(it), timeout=120.0)
+                    except StopAsyncIteration:
+                        break
+                    parts.append(token)
+                    if self._on_llm_token:
+                        self._on_llm_token(token)
+                    self._emit_turn_event("chat_message_delta", delta=token)
+            except asyncio.TimeoutError:
+                logger.error("LLM 流式生成超时 (text-only)，返回部分结果")
         raw = "".join(parts)
         emotion = _extract_emotion(raw)
         return _TAG_RE.sub("", raw).strip(), emotion
 
     async def _verified_journal_context(self, query: str) -> str:
         """Online-check the corpus, revalidate candidates, then return evidence."""
+        from chaihuo_reachy.memory.journal_fetcher import journal_sync_lock
+
         if self._memory is None:
             return ""
-        try:
-            await self._journal_fetcher.sync(memory_store=self._memory)
-        except Exception:
-            health = self._journal_fetcher.health()
-            if not health["complete"]:
-                logger.warning("No verified journal cache is available", exc_info=True)
-                return ""
-            logger.warning(
-                "Journal directory is partially unavailable; continuing with "
-                "%d individually verified cached entries (%d expected)",
-                health["complete"],
-                health["expected"],
-            )
+        # Respect the cross-process sync lock (systemd timer / dashboard
+        # auto-sync): skip this tick when another sync owns the corpus.
+        with journal_sync_lock(self.config.journal_cache_dir) as acquired:
+            if acquired:
+                try:
+                    await self._journal_fetcher.sync(memory_store=self._memory)
+                except Exception:
+                    health = self._journal_fetcher.health()
+                    if not health["complete"]:
+                        logger.warning(
+                            "No verified journal cache is available", exc_info=True
+                        )
+                        return ""
+                    logger.warning(
+                        "Journal directory is partially unavailable; continuing with "
+                        "%d individually verified cached entries (%d expected)",
+                        health["complete"],
+                        health["expected"],
+                    )
 
         target_date = _extract_target_date(query)
+        recent_days = _extract_recent_window(query)
+        journey_overview = is_journey_overview_query(query)
+        search_journey_overview = getattr(
+            self._memory, "search_journey_overview", None
+        )
+        overview_results = (
+            search_journey_overview(k=80)
+            if journey_overview and callable(search_journey_overview)
+            else []
+        )
         search_journey_scope = getattr(self._memory, "search_journey_scope", None)
         journey_scope = (
             search_journey_scope(query, k=6)
-            if not target_date and callable(search_journey_scope)
+            if not journey_overview
+            and not target_date
+            and not recent_days
+            and callable(search_journey_scope)
             else []
         )
-        results = journey_scope or (
+        results = overview_results or journey_scope or (
             self._memory.search_by_date(target_date, k=3)
             if target_date
-            else self._memory.search(query, k=self.config.memory_top_k)
+            else (
+                self._memory.search_recent(recent_days, k=6)
+                if recent_days
+                else (
+                    _keyword_search(self._memory, query, k=6)
+                    or self._memory.search(query, k=self.config.memory_top_k)
+                )
+            )
         )
         if not results:
             return ""
@@ -918,33 +1317,57 @@ class ConversationEngine:
         # search_by_date only returns manifest entries which cover target_date,
         # including multi-day title ranges whose primary ``date`` differs.
         exact_date = bool(target_date and results)
-        if not exact_date and float(results[0].get("score") or 0) < self.config.journal_relevance_threshold:
+        if (
+            not journey_overview
+            and not exact_date
+            and float(results[0].get("score") or 0)
+            < self.config.journal_relevance_threshold
+        ):
             return ""
 
         candidate_slugs = [str(r.get("slug") or r.get("id") or "") for r in results]
         candidate_slugs = [slug for slug in candidate_slugs if slug]
-        try:
-            await self._journal_fetcher.sync(
-                memory_store=self._memory,
-                refresh_slugs=candidate_slugs,
-            )
-            journey_scope = (
-                search_journey_scope(query, k=6)
-                if not target_date and callable(search_journey_scope)
-                else []
-            )
-            results = journey_scope or (
-                self._memory.search_by_date(target_date, k=3)
-                if target_date
-                else self._memory.search(query, k=self.config.memory_top_k)
-            )
-        except Exception:
-            logger.warning(
-                "Candidate journal revalidation was partial; using its "
-                "individually verified cached copy"
-            )
+        if not journey_overview:
+            with journal_sync_lock(self.config.journal_cache_dir) as acquired:
+                if not acquired:
+                    candidate_slugs = []  # busy: answer from the verified cache
+            try:
+                await self._journal_fetcher.sync(
+                    memory_store=self._memory,
+                    refresh_slugs=candidate_slugs,
+                )
+                journey_scope = (
+                    search_journey_scope(query, k=6)
+                    if not target_date
+                    and not recent_days
+                    and callable(search_journey_scope)
+                    else []
+                )
+                results = journey_scope or (
+                    self._memory.search_by_date(target_date, k=3)
+                    if target_date
+                    else (
+                        self._memory.search_recent(recent_days, k=6)
+                        if recent_days
+                        else (
+                            _keyword_search(self._memory, query, k=6)
+                            or self._memory.search(
+                                query, k=self.config.memory_top_k
+                            )
+                        )
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "Candidate journal revalidation was partial; using its "
+                    "individually verified cached copy"
+                )
 
-        selected = results[:1] if exact_date else results[:6 if journey_scope else 3]
+        selected = (
+            results
+            if journey_overview
+            else (results[:1] if exact_date else results[: 6 if journey_scope else 3])
+        )
         health = self._journal_fetcher.health()
         cache_note = (
             f"缓存最后完整校验：{health['last_success_at']}。"
@@ -952,40 +1375,71 @@ class ConversationEngine:
             else "本轮已在线校验官方目录和候选正文。"
         )
         blocks = [cache_note]
-        if target_date:
+        if journey_overview:
+            blocks.append(
+                f"这是历史旅程足迹汇总，不是当前位置查询。以下 {len(selected)} 篇"
+                "已验证日记标题覆盖目前可确认的完整路线。请按时间阶段概括主要省区、"
+                "城市和代表性站点；合并重复地点，不要回答‘我们现在在哪里’，也不要"
+                "把当前定位混入历史路线。"
+            )
+        elif target_date:
             relative_word = _relative_date_word(query)
             label = f"（用户原话：{relative_word}）" if relative_word else ""
             blocks.append(
                 f"程序已确定本题目标日期：{_format_chinese_date(target_date)}{label}。"
                 "这是确定性日历计算；回答时不得改成其他日期。"
             )
+        elif recent_days:
+            blocks.append(
+                f"程序已按用户时间词检索最近 {recent_days} 天内的日记（确定性日期窗口）。"
+                "回答必须基于以下这些日记的内容；日期以日记原文为准。"
+            )
         for item in selected:
             source = {
+                "type": "journey",
                 "slug": item.get("slug") or item.get("id"),
                 "title": item.get("title", ""),
                 "date": item.get("date", ""),
                 "url": item.get("source_url", ""),
                 "source_updated_at": item.get("source_updated_at", ""),
+                "score": round(float(item.get("score") or 0.0), 3),
             }
             self._current_sources.append(source)
+            if journey_overview:
+                blocks.append(
+                    f"{source['date'] or '日期未知'}｜{source['title']}"
+                )
+                continue
+            evidence = str(item.get("snippet") or "").strip()
+            if not evidence:
+                evidence = str(item.get("content") or "")[:3600 if exact_date else 2200]
             blocks.append(
                 f"日期：{source['date'] or '未知'}\n"
                 f"标题：{source['title']}\n"
                 f"来源：{source['url']}\n"
-                f"完整正文：\n{item.get('content', '')}"
+                f"匹配证据片段：\n{evidence}"
             )
         return "\n\n---\n\n".join(blocks)
 
     async def _execute_deterministic_motion(self, text: str) -> str:
-        if "跳" in text:
-            return await self._tool_dance("happy")
+        style = "happy"
+        if "机械" in text or "robot" in text:
+            style = "robot"
+        elif "摇摆" in text or "swing" in text or "慢" in text or "温柔" in text:
+            style = "swing"
+        elif "随便" in text or "随机" in text or "随意" in text or "自由" in text:
+            style = "random"
+        if "跳" in text or "舞" in text:
+            return await self._tool_dance(style)
         if "点头" in text:
             return await self._tool_gesture("nod", 2)
         if "摇头" in text:
             return await self._tool_gesture("shake_head", 2)
         if "挥" in text or "招呼" in text:
             return await self._tool_gesture("wave", 1)
-        return await self._tool_pose("sleep" if "睡" in text or "休息" in text else "wake_up")
+        return await self._tool_pose(
+            "sleep" if "睡" in text or "休息" in text else "wake_up"
+        )
 
     # ── Barge-in watcher ──────────────────────────────────────────────
 
@@ -1012,6 +1466,9 @@ class ConversationEngine:
         loud_frames = 0
         while not self._barge_in_requested:
             try:
+                # Dance owns the audio: barge-in must never kill the music.
+                if self._dance_loop_active:
+                    return
                 # Grace period — don't barge-in on the first ~300ms of TTS output
                 if time.monotonic() - start < holdoff_s:
                     await asyncio.sleep(0.1)
@@ -1024,9 +1481,11 @@ class ConversationEngine:
                         self._barge_in_requested = True
                         logger.info(
                             "🗣 [打断] 检测到持续语音 RMS=%.4f (阈值=%.3f) — 停止当前回答",
-                            rms, threshold,
+                            rms,
+                            threshold,
                         )
                         self._audio.stop_playback()
+                        self._stop_talk_motion_immediately()
                         self._barge_in_occurred = True
                         return
                 else:
@@ -1036,11 +1495,12 @@ class ConversationEngine:
             await asyncio.sleep(0.05)
 
     # ── LLM → TTS ──────────────────────────────────────────────────────
-    async def _think_and_speak(
-        self, messages: list[dict[str, str]]
-    ) -> tuple[str, str]:
+    async def _think_and_speak(self, messages: list[dict[str, str]]) -> tuple[str, str]:
         """Run LLM and stream tokens to TTS. Returns (full_text, emotion)."""
         assert self._audio is not None
+        if self._dance_loop_active:
+            logger.info("🎵 连跳进行中，跳过本轮回答")
+            return "", ""
 
         # Set TTS output rate (Qwen Realtime = 24kHz)
         self._audio.set_output_sample_rate(self.config.tts_sample_rate)
@@ -1113,10 +1573,13 @@ class ConversationEngine:
                         self._emit_turn_event("chat_message_delta", delta=token)
 
                         token_buf += token
-                        if any(
-                            token_buf.rstrip().endswith(p)
-                            for p in ("。", "！", "？", ".", "!", "?", "\n")
-                        ) or len(token_buf) >= 40:
+                        if (
+                            any(
+                                token_buf.rstrip().endswith(p)
+                                for p in ("。", "！", "？", ".", "!", "?", "\n")
+                            )
+                            or len(token_buf) >= 40
+                        ):
                             clean = _TAG_RE.sub("", token_buf.strip())
                             if clean:
                                 await tts_text_queue.put(clean)
@@ -1129,13 +1592,32 @@ class ConversationEngine:
 
                 llm_task = asyncio.create_task(_consume_llm())
                 try:
+                    # Hard ceiling on LLM streaming so a hung upstream never
+                    # leaves the dashboard stuck on "thinking" forever.
                     if barge_watcher is None:
-                        await llm_task
+                        await asyncio.wait_for(llm_task, timeout=120.0)
                     else:
-                        done, _ = await asyncio.wait(
-                            (llm_task, barge_watcher),
-                            return_when=asyncio.FIRST_COMPLETED,
+                        done, _ = await asyncio.wait_for(
+                            asyncio.wait(
+                                (llm_task, barge_watcher),
+                                return_when=asyncio.FIRST_COMPLETED,
+                            ),
+                            timeout=120.0,
                         )
+                except asyncio.TimeoutError:
+                    logger.error("LLM 流式生成超时，终止当前回合")
+                    llm_task.cancel()
+                    try:
+                        await llm_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    done, _ = await asyncio.wait(
+                        (
+                            llm_task,
+                            barge_watcher or asyncio.create_task(asyncio.sleep(0)),
+                        ),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
                     if (
                         barge_watcher is not None
                         and barge_watcher in done
@@ -1165,7 +1647,9 @@ class ConversationEngine:
                     except asyncio.CancelledError:
                         pass
                     except Exception:
-                        logger.debug("TTS worker ended during turn cleanup", exc_info=True)
+                        logger.debug(
+                            "TTS worker ended during turn cleanup", exc_info=True
+                        )
                     if barge_watcher is not None:
                         barge_watcher.cancel()
                         try:
@@ -1208,6 +1692,9 @@ class ConversationEngine:
         """Bridge sync TTS callback (from SDK thread) → async audio playback."""
         if self._audio is None or self._loop is None:
             return
+        if self._dance_loop_active:
+            logger.debug("Dropping TTS PCM while beat dance active")
+            return
         if generation is not None and generation != self._active_tts_generation:
             logger.debug("Dropping late TTS PCM for generation %d", generation)
             return
@@ -1222,18 +1709,59 @@ class ConversationEngine:
     async def _play_tts_audio(
         self, pcm: bytes, sample_rate: int, generation: int | None = None
     ) -> None:
-        """Queue PCM for playback."""
+        """Queue conversational PCM; the speaker observer drives motion."""
         assert self._audio is not None
         if generation is not None and generation != self._active_tts_generation:
             return
+        if self._dance_loop_active:
+            return  # music owns the buffer — never interleave TTS
         self._audio.set_output_sample_rate(sample_rate)
+        # Start motion before exposing PCM to the speaker buffer.  This closes
+        # the first-chunk race where the status could report audible playback
+        # for one poll while the talk-motion task had not started yet.
+        if (
+            not self._speech_pcm_active
+            and self._motion is not None
+            and self.config.wobbling_enabled
+        ):
+            start_motion = getattr(self._motion, "start_talk_motion", None)
+            if callable(start_motion):
+                start_motion()
+        self._speech_pcm_active = True
         await self._audio.play(pcm)
+
+    def _on_speaker_pcm(self, pcm: bytes, sample_rate: int) -> None:
+        """Forward only currently audible conversational PCM to motion.
+
+        This callback runs on ALSA/PortAudio's real-time output thread.  The
+        motion controller's feed method is deliberately non-blocking and
+        drop-oldest, so speaker timing can never wait for a motor command.
+        """
+        if (
+            not self._speech_pcm_active
+            or self._dance_loop_active
+            or self._motion is None
+            or not self.config.wobbling_enabled
+        ):
+            return
+        feed = getattr(self._motion, "feed_talk_audio", None)
+        if callable(feed):
+            feed(pcm, sample_rate)
+
+    def _stop_talk_motion_immediately(self) -> None:
+        if self._motion is None:
+            return
+        stop_motion = getattr(self._motion, "stop_talk_motion", None)
+        if callable(stop_motion):
+            stop_motion(immediate=True)
 
     async def _wait_for_playback_drain(self) -> None:
         """Wait until all queued audio has been played."""
         assert self._audio is not None
         while any(not future.done() for future in tuple(self._pending_playbacks)):
             await asyncio.sleep(0.01)
+        if self._dance_loop_active:
+            return  # buffer is owned by music; drain would wait for the whole dance
         while self._audio.is_playing:
             await asyncio.sleep(0.05)
 
@@ -1260,6 +1788,7 @@ class ConversationEngine:
         async with self._speaking_lock:
             assert self._audio is not None
             self._tts_playing = True
+            self._speech_pcm_active = False
             self._barge_in_occurred = False
             self._set_state("speaking")
             drain_task = asyncio.create_task(self._drain_audio())
@@ -1270,12 +1799,21 @@ class ConversationEngine:
                 try:
                     await self._wait_for_playback_drain()
                 finally:
+                    # The audio backend is authoritative for speech end.  TTS
+                    # callbacks may finish seconds before queued PCM is heard,
+                    # so stopping anywhere earlier truncates the head motion.
+                    if self._motion is not None:
+                        stop_motion = getattr(self._motion, "stop_talk_motion", None)
+                        if callable(stop_motion):
+                            stop_motion(immediate=self._barge_in_occurred)
+                    self._speech_pcm_active = False
                     self._tts_playing = False
                     # Skip echo gate when barge-in occurred — user is already talking
                     if not self._barge_in_occurred:
                         self._listen_not_before = max(
                             self._listen_not_before,
-                            time.monotonic() + max(0.0, self.config.post_playback_silence_s),
+                            time.monotonic()
+                            + max(0.0, self.config.post_playback_silence_s),
                         )
                     else:
                         logger.debug("Barge-in: skipping echo gate")
@@ -1318,15 +1856,24 @@ class ConversationEngine:
             return ""
         if not self.config.enable_wake_word:
             return normalized
+        if self.config.wake_engine != "cloud":
+            # Local KWS already gated this turn; only a bare wake word gets
+            # the canned response, everything else is a real instruction.
+            wake_words = [
+                phrase.strip().lower()
+                for phrase in self.config.wake_words.split(",")
+                if phrase.strip()
+            ]
+            if stripped.lower() in wake_words:
+                return _WAKE_ONLY
+            return normalized
 
         now = time.monotonic()
 
-        # Check for wake word
+        # Check for wake word (cloud engine only)
         remaining = self._strip_wake_word(normalized)
         if remaining is not None:
-            self._wake_word_active_until = (
-                now + self.config.wake_word_timeout_s
-            )
+            self._wake_word_active_until = now + self.config.wake_word_timeout_s
             if not remaining:
                 logger.info("Wake word only — scheduling synchronous canned response")
                 return _WAKE_ONLY
@@ -1341,7 +1888,12 @@ class ConversationEngine:
         return ""
 
     def _strip_wake_word(self, normalized: str) -> str | None:
-        """Return text after first wake word, or None if no wake word."""
+        """Return text after a wake word at the start, or None if absent.
+
+        Only a *leading* wake word is stripped: a wake word in the middle or
+        end of a sentence is the user's own words (e.g. "我不吃皮皮虾",
+        "跳个正常点的舞蹈。皮皮虾。") and must not truncate the instruction.
+        """
         wake_words = [
             phrase.strip().lower()
             for phrase in self.config.wake_words.split(",")
@@ -1349,14 +1901,15 @@ class ConversationEngine:
         ]
         lowered = normalized.lower()
         for ww in wake_words:
-            idx = lowered.find(ww)
-            if idx != -1:
-                return normalized[idx + len(ww):].strip(" ，,。！？!?")
+            if lowered.startswith(ww):
+                return normalized[len(ww) :].strip(" ，,。！？!?")
         return None
 
     async def _speak_wake_response(self) -> None:
         """Play the canned wake-word acknowledgment."""
         assert self._audio is not None
+        if self._dance_loop_active:
+            return
         text = self.config.wake_response
         logger.info("Wake response: %s", text)
 
@@ -1375,6 +1928,8 @@ class ConversationEngine:
     async def _speak_greeting(self) -> None:
         """Play the startup greeting."""
         assert self._audio is not None
+        if self._dance_loop_active:
+            return
         lang = self._language
         text = (
             "嗨，我是皮皮虾！柴火基地车的AI小助手，有什么想聊的随时叫我哦。"
@@ -1398,6 +1953,10 @@ class ConversationEngine:
     def runtime_status(self) -> dict[str, object]:
         """Sanitized live status used by diagnostics and the Dashboard."""
         now = time.monotonic()
+        if self._beat_dance is not None and self._dance_loop_active:
+            status = self._beat_dance.status()
+            status["dance_loop_active"] = True
+            return status
         if self._audio:
             ri = self._audio.resolved_info
             audio = ri if isinstance(ri, dict) else ri.to_dict()
@@ -1407,11 +1966,22 @@ class ConversationEngine:
         # Use play_rms() method (available on all AudioBackend implementations)
         capture_rms = self._audio.play_rms() if self._audio else 0.0
         capture_db = round(20.0 * math.log10(max(capture_rms, 1e-8)), 1)
+        speaker_playing = bool(self._audio and self._audio.is_playing)
+        speech_audio_playing = bool(speaker_playing and self._speech_pcm_active)
+        talk_motion_active = bool(
+            self._motion is not None and getattr(self._motion, "is_talk_shaking", False)
+        )
         location = (
             self._location.latest_position.to_dict()
             if self._location and self._location.latest_position
             else None
         )
+        if self._session_location is not None:
+            location = dict(self._session_location)
+        try:
+            journal_health = self._memory.health() if self._memory is not None else None
+        except Exception:
+            journal_health = None
         return {
             "state": self._state,
             "language": self._language,
@@ -1420,6 +1990,19 @@ class ConversationEngine:
             "audio_level_db": capture_db,
             "echo_gate_remaining_s": round(max(0.0, self._listen_not_before - now), 3),
             "tts_playing": self._tts_playing,
+            "speaker_playing": speaker_playing,
+            "speech_audio_playing": speech_audio_playing,
+            "talk_motion_active": talk_motion_active,
+            "talk_motion_backend": getattr(
+                self._motion, "talk_motion_backend", "disabled"
+            ),
+            "talk_motion_envelope": round(
+                float(getattr(self._motion, "talk_motion_envelope", 0.0)), 3
+            ),
+            "talk_motion_error": getattr(self._motion, "talk_motion_error", ""),
+            "talk_motion_dropped_frames": int(
+                getattr(self._motion, "talk_motion_dropped_frames", 0)
+            ),
             "barge_in_occurred": self._barge_in_occurred,
             "wake_word_active": now < self._wake_word_active_until,
             "asr": {
@@ -1429,7 +2012,11 @@ class ConversationEngine:
                 "last_end_reason": self._last_asr_end_reason,
             },
             "conversation_turns": len(self._conversation_history) // 2,
+            "conversation_idle_reset_s": self.config.session_reset_idle_s,
+            "last_topic": self._last_topic,
+            "last_evidence_ids": list(self._last_evidence_ids),
             "location": location,
+            "journal_health": journal_health,
         }
 
     # ── Debug: text-in / text-out ─────────────────────────────────────
@@ -1442,6 +2029,17 @@ class ConversationEngine:
         client_message_id: str = "",
     ) -> dict[str, Any]:
         """Process typed input through the exact same coordinator as ASR."""
+        if self._dance_loop_active:
+            return {
+                "reply": "正在跳舞，等音乐停了再聊吧～",
+                "emotion": "",
+                "memory_context": "",
+                "vision_context": "",
+                "intent": TurnIntent.GENERAL.value,
+                "sources": [],
+                "error": "",
+                "turn_id": "",
+            }
         normalized = " ".join(text.split()).strip()
         if not normalized:
             return {
@@ -1469,6 +2067,8 @@ class ConversationEngine:
         Uses the same speaking lock and echo gate as voice turns.
         """
         assert self._audio is not None
+        if self._dance_loop_active:
+            return
         self._audio.set_output_sample_rate(self.config.tts_sample_rate)
         async with self._speaking_scope():
             try:
@@ -1481,22 +2081,187 @@ class ConversationEngine:
             except Exception:
                 logger.exception("Debug TTS failed")
 
-    async def _tool_get_current_location(self) -> str:
-        """Return the real-time GPS position of the vehicle."""
-        manual_location = self.config.manual_location.strip()
+    def _set_session_location(self, place: str) -> None:
+        now = datetime.now(timezone.utc)
+        self._session_location = {
+            "ok": True,
+            "place": place.strip().strip("'\"“”"),
+            "province": "",
+            "city": "",
+            "adcode": "",
+            "coordinates": None,
+            "accuracy_m": None,
+            "precision": "point",
+            "source": "session_user",
+            "observed_at": now.isoformat(),
+            "is_stale": False,
+        }
+
+    def _session_location_context(self) -> str:
+        if not self._session_location:
+            return ""
+        place = str(self._session_location.get("place") or "")
+        return (
+            f"我们现在在{place}。这是用户本次会话明确更新的当前位置；"
+            "只可作为当前地点，不能据此编造过去在这里发生的旅途故事。"
+        )
+
+    async def _tool_get_current_location(
+        self, *, refresh: bool = False
+    ) -> dict[str, Any]:
+        """Return a normalized, source-labelled location tool payload."""
+
+        if self._session_location is not None:
+            return dict(self._session_location)
+
+        if self._location is not None:
+            try:
+                pos = await self._location.get_position(refresh=refresh)
+                if pos.source != "unavailable":
+                    if pos.lat is not None and pos.lon is not None:
+                        logger.info("📍 位置查询成功 (%s, %s)", pos.source, pos.precision)
+                    return {
+                        "ok": True,
+                        "place": pos.address or pos.city or pos.province,
+                        "province": pos.province,
+                        "city": pos.city,
+                        "adcode": pos.adcode,
+                        "coordinates": (
+                            {"latitude": pos.lat, "longitude": pos.lon}
+                            if pos.lat is not None and pos.lon is not None
+                            else None
+                        ),
+                        "accuracy_m": pos.accuracy_m,
+                        "precision": pos.precision,
+                        "source": pos.source,
+                        "observed_at": datetime.fromtimestamp(
+                            pos.timestamp, tz=timezone.utc
+                        ).isoformat(),
+                        "is_stale": False,
+                    }
+                location_error = pos.error
+            except Exception:
+                logger.exception("Location tool failed")
+                location_error = "位置查询异常"
+        else:
+            location_error = "定位服务未启动"
+
+        manual_location = self.config.manual_location.strip().strip("'\"“”")
         if manual_location:
-            return f"我们现在在{manual_location.strip(chr(39) + chr(34) + '“”')}。"
-        if self._location is None:
-            return "定位服务未启动，无法获取位置信息。"
+            return {
+                "ok": True,
+                "place": manual_location,
+                "province": "",
+                "city": "",
+                "adcode": "",
+                "coordinates": None,
+                "accuracy_m": None,
+                "precision": "city",
+                "source": "configured_fallback",
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "is_stale": True,
+            }
+        return {
+            "ok": False,
+            "place": "",
+            "province": "",
+            "city": "",
+            "adcode": "",
+            "coordinates": None,
+            "accuracy_m": None,
+            "precision": "unknown",
+            "source": "unavailable",
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "is_stale": False,
+            "error": location_error or "当前无法获取定位",
+        }
+
+    async def _prepare_location_tool_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Force one registered location tool call, then return its tool result."""
+
+        tool_call_id = f"location_{uuid.uuid4().hex[:12]}"
+        assistant_message: dict[str, Any] | None = None
+        refresh = False
+        if self.config.bailian_api_key:
+            try:
+                async with BailianLLMClient(self.config) as llm:
+                    response = await llm.chat(
+                        messages,
+                        tools=[_LOCATION_TOOL_SCHEMA],
+                        tool_choice={
+                            "type": "function",
+                            "function": {"name": "get_current_location"},
+                        },
+                    )
+                candidate = (response.get("choices") or [{}])[0].get("message") or {}
+                calls = candidate.get("tool_calls") or []
+                if calls:
+                    call = calls[0]
+                    if (call.get("function") or {}).get("name") == "get_current_location":
+                        assistant_message = candidate
+                        tool_call_id = str(call.get("id") or tool_call_id)
+                        try:
+                            arguments = json.loads(
+                                str((call.get("function") or {}).get("arguments") or "{}")
+                            )
+                            refresh = bool(arguments.get("refresh", False))
+                        except (json.JSONDecodeError, AttributeError):
+                            refresh = False
+            except Exception:
+                # Deterministic source routing remains authoritative if the
+                # model's tool-planning request is unavailable.
+                logger.warning("Location tool planning failed; executing directly", exc_info=True)
+
+        if assistant_message is None:
+            assistant_message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "get_current_location",
+                            "arguments": json.dumps(
+                                {"refresh": refresh}, ensure_ascii=False
+                            ),
+                        },
+                    }
+                ],
+            }
+
         try:
-            pos = await self._location.get_position()
-            if pos.source == "unavailable":
-                return "当前无法获取位置信息。请检查 GPS 设备连接或网络是否正常。"
-            logger.info("📍 位置查询: %.6f, %.6f (%s)", pos.lat, pos.lon, pos.source)
-            return pos.to_llm_context()
-        except Exception:
-            logger.exception("Location tool failed")
-            return "位置查询失败，请稍后重试。"
+            payload = await asyncio.wait_for(
+                self._tool_get_current_location(refresh=refresh), timeout=3.0
+            )
+        except asyncio.TimeoutError:
+            payload = {
+                "ok": False,
+                "place": "",
+                "precision": "unknown",
+                "source": "unavailable",
+                "error": "定位工具执行超时",
+            }
+        self._current_sources.append(
+            {
+                "type": "live_location",
+                "title": "实时位置工具",
+                "source": payload.get("source", "unavailable"),
+                "precision": payload.get("precision", "unknown"),
+            }
+        )
+        return [
+            *messages,
+            assistant_message,
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "name": "get_current_location",
+                "content": json.dumps(payload, ensure_ascii=False),
+            },
+        ]
 
     async def _tool_capture_rear_view(self) -> str:
         """Capture rear-view (EZVIZ) snapshot and run VLM to describe."""
@@ -1592,16 +2357,220 @@ class ConversationEngine:
 
     # ── Motion tool handlers ─────────────────────────────────────────
 
-    async def _tool_dance(self, style: str = "happy") -> str:
-        """Execute a dance via the MotionController."""
+    async def _tool_dance(
+        self, style: str = "happy", duration_limit_s: float | None = None
+    ) -> str:
+        """Execute a dance via the MotionController, with backing music.
+
+        The backing track's BPM paces the choreography; the dance runs up
+        to ``duration_limit_s`` (default: min(track length, 60 s)) and stops
+        early when the music is shorter.  Without a track the dance runs a
+        single pass at a default tempo.
+        """
+        from pathlib import Path
+
+        from chaihuo_reachy.music import detect_bpm, read_track, resolve_track
+
         if self._motion is None:
             return "运动控制未启用，无法跳舞。"
+        beat_s = 0.5
+        duration_s: float | None = None
+        track = resolve_track(Path(self.config.dance_music_dir), style)
+        if track is not None:
+            info = read_track(track)
+            if info is not None:
+                sr, pcm = info
+                bpm = detect_bpm(pcm, sr)
+                if bpm:
+                    beat_s = 60.0 / bpm
+                limit = min(
+                    len(pcm) / 2 / sr,
+                    duration_limit_s or self.config.dance_duration_s,
+                )
+                duration_s = max(10.0, limit)  # never shorter than 10 s
+                logger.info(
+                    "🎵 伴奏: %s (%.1fs, BPM=%s, 拍长 %.3fs, 舞时长 %.0fs)",
+                    track.name,
+                    len(pcm) / 2 / sr,
+                    bpm if bpm else "未检出",
+                    beat_s,
+                    duration_s,
+                )
+        music_task: asyncio.Task | None = None
+        if self._audio is not None:
+            music_task = asyncio.create_task(self._play_dance_music(style, track))
         try:
-            await self._motion.dance(style)
+            summary = await self._motion.dance(
+                style, duration_s=duration_s, beat_s=beat_s
+            )
+            skipped = int(summary.get("skipped") or 0)
+            if skipped:
+                logger.warning(
+                    "Dance %s finished with %d skipped step(s)", style, skipped
+                )
+                return f"跳完啦！有{skipped}个动作没跟上，但整体完成。"
             return f"跳了一段{style}风格的舞蹈！"
         except Exception as e:
             logger.exception("Dance failed")
             return f"跳舞失败: {e}"
+        finally:
+            if music_task is not None:
+                music_task.cancel()
+                try:
+                    await music_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _play_dance_music(self, style: str, track: Path | None = None) -> None:
+        """Loop a backing track while the dance runs (best-effort).
+
+        ``track`` is the resolved music file (or None to resolve here).
+        Missing/unreadable tracks are fine — the dance proceeds silently.
+        Chunks are fed to the speaker at real-time pace; the task is
+        cancelled when the dance finishes.
+        """
+        from pathlib import Path
+
+        from chaihuo_reachy.music import read_track, resolve_track
+
+        assert self._audio is not None
+        if track is None:
+            track = resolve_track(Path(self.config.dance_music_dir), style)
+        if track is None:
+            logger.info("未找到伴奏音乐，安静跳舞")
+            return
+        info = read_track(track)
+        if info is None:
+            return
+        sr, frames = info
+        logger.info("🎵 播放伴奏: %s (%.1fs)", track.name, len(frames) / 2 / sr)
+        self._audio.set_output_sample_rate(sr)
+        chunk_size = sr * 2 // 5  # 0.2s 一块，实时节奏喂给播放队列
+        try:
+            while True:
+                for start in range(0, len(frames), chunk_size):
+                    await self._audio.play(frames[start : start + chunk_size])
+                    # seconds, not bytes (int16 = 2 bytes/frame)
+                    await asyncio.sleep(chunk_size / 2 / sr)
+        except asyncio.CancelledError:
+            logger.debug("伴奏播放结束: %s", track.name)
+            raise
+
+    # ── Beat-dance loop (infinite beat-synced dance, suspends voice) ──
+    async def _suspend_voice_for_dance(self) -> None:
+        """Give the dance exclusive ownership of the audio device.
+
+        Called once per ``start_beat_dance`` BEFORE the music task starts.
+        Aborts any in-flight TTS (barge-in flag + generation bump), engages
+        the ``_dance_loop_active`` gates, flushes the shared playback buffer
+        twice around the in-flight coroutine wait so no TTS chunk survives
+        into the music stream.
+        """
+        if self._tts_playing or self._state in ("speaking", "thinking"):
+            logger.info("🎵 连跳接管：取消当前回答")
+        # Abort the in-flight reply through the existing barge-in path
+        # (the watcher exits without calling stop_playback()).
+        self._barge_in_requested = True
+        # Invalidate every in-flight TTS generation (mirrors _think_and_speak).
+        self._tts_generation += 1
+        self._active_tts_generation = self._tts_generation
+        # Engage all conversation gates before the music task starts.
+        self._dance_loop_active = True
+        if self._motion is not None:
+            self._stop_talk_motion_immediately()
+        if self._audio is not None:
+            self._audio.stop_playback()
+        # Let in-flight _play_tts_audio coroutines that already passed the
+        # generation check finish (each is sub-millisecond), then flush once
+        # more to catch the chunk between its check and play().
+        while any(not future.done() for future in tuple(self._pending_playbacks)):
+            await asyncio.sleep(0.01)
+        if self._audio is not None:
+            self._audio.stop_playback()
+
+    async def start_beat_dance(self) -> str:
+        """Start the infinite beat dance. Returns a user-facing message."""
+        if self._beat_dance is None:
+            return "节拍连跳未启用（缺少 beat 控制器）"
+        if self._dance_loop_active:
+            return "已经在跳啦"
+        await self._suspend_voice_for_dance()
+        info = self._beat_dance.start()
+        if info is None:
+            return "节拍音乐或节拍数据缺失，无法连跳"
+        # One-shot resample to the output rate so per-chunk playback never
+        # pays the numpy interpolation cost (asyncio jitter ⇒ stutter).
+        sr, pcm = info
+        target_sr = int(getattr(self._audio, "output_sr", 16000) or 16000)
+        if sr != target_sr:
+            from chaihuo_reachy.music import resample_pcm
+
+            logger.info("🎵 伴奏重采样 %dHz → %dHz（一次性）", sr, target_sr)
+            pcm = resample_pcm(pcm, sr, target_sr)
+            sr = target_sr
+        self._dance_loop_active = True
+        self._set_state("dancing")
+        self._beat_music_task = asyncio.create_task(self._play_beat_music((sr, pcm)))
+        logger.info("🎵 无限节拍连跳开始（语音挂起）")
+        return "开始跳舞！"
+
+    async def stop_beat_dance(self) -> str:
+        """Stop the infinite beat dance and resume conversation."""
+        if self._beat_music_task is not None:
+            self._beat_music_task.cancel()
+            try:
+                await self._beat_music_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._beat_music_task = None
+        if self._audio is not None:
+            stop = getattr(self._audio, "stop_playback", None)
+            if callable(stop):
+                stop()
+        if self._beat_dance is not None:
+            self._beat_dance.stop()
+        self._dance_loop_active = False
+        self._set_state("idle")
+        logger.info("⏹ 无限节拍连跳停止，恢复语音对话")
+        return "停啦"
+
+    async def _play_beat_music(self, info: tuple[int, bytes]) -> None:
+        """Feed beat.mp3 PCM to the speaker in a real-time loop (infinite).
+
+        Prefills ~2 s of audio so asyncio scheduling jitter (KWS polling,
+        websocket traffic) never empties the playback buffer — an empty
+        buffer is heard as stutter.  Then replenishes one 1 s chunk per
+        second, keeping the buffer at a stable ~2 s cushion.
+        """
+        assert self._audio is not None
+        sr, frames = info
+        logger.info("🎵 无限循环播放: beat.mp3 (%.1fs @%dHz)", len(frames) / 2 / sr, sr)
+        self._audio.set_output_sample_rate(sr)
+        chunk_size = sr * 2  # 1.0s 一块
+        total = len(frames) // chunk_size
+        if total == 0:
+            total = 1
+        idx = 0
+
+        def next_chunk() -> bytes:
+            nonlocal idx
+            start = (idx % total) * chunk_size
+            chunk = frames[start : start + chunk_size]
+            idx += 1
+            return chunk
+
+        # Prefill ~2s to absorb scheduling jitter before real-time pacing.
+        await self._audio.play(next_chunk())
+        await self._audio.play(next_chunk())
+        try:
+            while True:
+                await self._audio.play(next_chunk())
+                # chunk_size bytes = 1s of int16 mono; sleep must be in
+                # SECONDS (÷2 bytes/frame) — a raw chunk_size/sr slept 2s
+                # per 1s chunk and starved the buffer into 1s-on/1s-off.
+                await asyncio.sleep(chunk_size / 2 / sr)
+        except asyncio.CancelledError:
+            raise
 
     async def _tool_gesture(self, gesture: str, times: int = 1) -> str:
         """Execute a gesture via the MotionController."""
@@ -1650,6 +2619,7 @@ class ConversationEngine:
     async def _play_feedback_sound(self, state: str) -> None:
         """Play a short synthesized beep for state transitions."""
         import numpy as np
+
         try:
             sr = 16000
             duration = 0.08
@@ -1685,6 +2655,41 @@ def _extract_emotion(text: str) -> str:
     return m.group(1).lower() if m else ""
 
 
+def _keyword_search(memory: Any, query: str, k: int = 6) -> list[dict[str, Any]]:
+    """Entity-term full-text retrieval with a defensive fallback.
+
+    Some memory stand-ins (tests, downgraded stores) predate
+    ``search_keywords``; treat them as "no keyword hits" and let the vector
+    search take over.
+    """
+    fn = getattr(memory, "search_keywords", None)
+    if not callable(fn):
+        return []
+    try:
+        return fn(query, k=k)
+    except Exception:
+        logger.debug("keyword search failed", exc_info=True)
+        return []
+
+
+def _extract_recent_window(query: str) -> int | None:
+    """Detect "最近发生了什么 / 这几天 / 近来" queries → days window.
+
+    Vector search has no notion of recency, so these relative-time queries
+    need a date-window retrieval (``MemoryStore.search_recent``) instead of
+    similarity search.
+    """
+    compact = re.sub(r"\s+", "", query)
+    if any(word in compact for word in ("这几天", "这两天", "近来", "近期")):
+        return 3
+    if "最近" in compact:
+        match = re.search(r"最近(\d+)天", compact)
+        if match:
+            return min(30, max(1, int(match.group(1))))
+        return 7
+    return None
+
+
 def _extract_target_date(query: str) -> str | None:
     """Detect time-based queries and return the target ISO date.
 
@@ -1699,16 +2704,30 @@ def _extract_target_date(query: str) -> str | None:
 
     # Relative days
     relative_days = {
-        "大前天": 3, "前天": 2, "昨天": 1,
-        "今天": 0, "今日": 0,
-        "明天": -1, "后天": -2, "大后天": -3,
+        "大前天": 3,
+        "前天": 2,
+        "昨天": 1,
+        "今天": 0,
+        "今日": 0,
+        "明天": -1,
+        "后天": -2,
+        "大后天": -3,
     }
     for word, offset in relative_days.items():
         if word in q:
             return (today - timedelta(days=offset)).isoformat()
 
     # Day of week: 周一/... / 上周一/... / 下周一/...
-    weekday_map = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+    weekday_map = {
+        "一": 0,
+        "二": 1,
+        "三": 2,
+        "四": 3,
+        "五": 4,
+        "六": 5,
+        "日": 6,
+        "天": 6,
+    }
     week_match = re.search(r"(上周|下周|周|星期)([一二三四五六日天])", q)
     if week_match:
         prefix = week_match.group(1)
@@ -1736,7 +2755,9 @@ def _extract_target_date(query: str) -> str | None:
         if m:
             try:
                 if fmt == "%Y-%m-%d":
-                    return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+                    return date(
+                        int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    ).isoformat()
                 else:
                     d = date(today.year, int(m.group(1)), int(m.group(2)))
                     return d.isoformat()

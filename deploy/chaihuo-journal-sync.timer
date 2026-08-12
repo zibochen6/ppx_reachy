@@ -1,0 +1,11 @@
+[Unit]
+Description=Run chaihuo-journal-sync 2min after boot and every 4 hours
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=4h
+RandomizedDelaySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

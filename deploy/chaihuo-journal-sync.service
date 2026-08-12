@@ -1,0 +1,11 @@
+[Unit]
+Description=Chaihuo Reachy — incremental Yuque journal sync into Chroma
+
+[Service]
+Type=oneshot
+User=recomputer
+WorkingDirectory=/home/recomputer/chaihuo_reachy
+Environment=PATH=/home/recomputer/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ExecStart=/home/recomputer/.local/bin/uv run --no-sync chaihuo-reachy sync-journals
+TimeoutStartSec=900

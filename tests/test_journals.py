@@ -306,9 +306,169 @@ def test_journey_scope_returns_every_matching_region_day_in_date_order(tmp_path:
     ]
 
 
+def test_journey_overview_returns_all_verified_titles_in_date_order(tmp_path: Path) -> None:
+    journal_dir = tmp_path / "journals"
+    journal_dir.mkdir()
+    entries = {}
+    for slug, status, date, title in (
+        ("later", "complete", "2026-05-02", "基地车日记｜阳江到玉林"),
+        ("early", "complete", "2026-05-01", "基地车日记｜广东科学中心到阳江"),
+        ("broken", "incomplete", "2026-05-03", "未完成日记｜不应出现"),
+    ):
+        path = journal_dir / f"{slug}.md"
+        path.write_text("已验证正文", encoding="utf-8")
+        entries[slug] = {
+            "slug": slug,
+            "status": status,
+            "title": title,
+            "date": date,
+            "file": str(path),
+            "source_url": f"https://example.test/{slug}",
+        }
+    (journal_dir / "manifest.json").write_text(
+        json.dumps({"entries": entries}, ensure_ascii=False), encoding="utf-8"
+    )
+    store = MemoryStore.__new__(MemoryStore)
+    store._journal_dir = journal_dir
+    store._manifest_path = journal_dir / "manifest.json"
+
+    result = store.search_journey_overview()
+
+    assert [item["slug"] for item in result] == ["early", "later"]
+    assert result[0]["snippet"] == "基地车日记｜广东科学中心到阳江"
+
+
+def test_journey_overview_formats_provinces_without_geography_hallucination(
+    tmp_path: Path,
+) -> None:
+    journal_dir = tmp_path / "journals"
+    journal_dir.mkdir()
+    entries = {}
+    for slug, date, title in (
+        ("south", "2026-05-04", "基地车日记｜格凸河-贵阳"),
+        ("west", "2026-07-06", "基地车日记｜伊吾→哈密"),
+        ("gansu", "2026-07-07", "基地车日记｜哈密→敦煌"),
+        ("north", "2026-08-05", "基地车日记｜呼和浩特"),
+    ):
+        path = journal_dir / f"{slug}.md"
+        path.write_text("已验证正文", encoding="utf-8")
+        entries[slug] = {
+            "slug": slug,
+            "status": "complete",
+            "title": title,
+            "date": date,
+            "file": str(path),
+        }
+    (journal_dir / "manifest.json").write_text(
+        json.dumps({"entries": entries}, ensure_ascii=False), encoding="utf-8"
+    )
+    store = MemoryStore.__new__(MemoryStore)
+    store._journal_dir = journal_dir
+    store._manifest_path = journal_dir / "manifest.json"
+
+    reply = store.format_journey_overview()
+
+    assert "贵州（格凸河、贵阳）" in reply
+    assert "新疆（伊吾、哈密） → 甘肃（敦煌）" in reply
+    assert "内蒙古（呼和浩特）" in reply
+    assert "甘肃（哈密" not in reply
+    assert "总里程和行政区数量我不额外猜" in reply
+
+
 def test_compact_multi_day_title_covers_every_day() -> None:
     title = "基地车日记｜2026.05.18-20｜成都-江油-唐家河"
     assert _title_range_contains(title, "2026-05-18")
     assert _title_range_contains(title, "2026-05-19")
     assert _title_range_contains(title, "2026-05-20")
     assert not _title_range_contains(title, "2026-05-21")
+
+
+def test_v3_entity_gate_never_substitutes_another_university(tmp_path: Path) -> None:
+    journal_dir = tmp_path / "journals"
+    journal_dir.mkdir()
+    entries = {}
+    for slug, title, date, content in (
+        (
+            "hohhot",
+            "基地车日记｜呼和浩特",
+            "2026-08-05",
+            "今天是内蒙古第一站，我们在呼和浩特走进卓因科技并参观羊场。",
+        ),
+        (
+            "guizhou-university",
+            "基地车日记｜贵州大学",
+            "2026-05-10",
+            "我们在贵州大学做了一次创客交流。",
+        ),
+        (
+            "xian-university",
+            "基地车日记｜西安理工大学",
+            "2026-07-27",
+            "我们在西安理工大学交流开源硬件。",
+        ),
+    ):
+        path = journal_dir / f"{slug}.md"
+        path.write_text(content * 20, encoding="utf-8")
+        entries[slug] = {
+            "slug": slug,
+            "status": "complete",
+            "title": title,
+            "date": date,
+            "dates": [date],
+            "file": str(path),
+            "source_url": f"https://example.test/{slug}",
+            "fetched_at": "2026-08-06T00:00:00Z",
+        }
+    (journal_dir / "manifest.json").write_text(
+        json.dumps({"entries": entries}, ensure_ascii=False), encoding="utf-8"
+    )
+    store = MemoryStore(
+        persist_dir=str(tmp_path / "chroma"),
+        journal_dir=str(journal_dir),
+        use_v3=True,
+    )
+
+    inner_mongolia = store.search_journey_scope(
+        "我们在内蒙古都做了什么", k=6
+    )
+    tsinghua = store.search_keywords("我们在清华大学有什么故事", k=6)
+
+    assert [item["slug"] for item in inner_mongolia] == ["hohhot"]
+    assert tsinghua == []
+
+
+def test_v3_health_exposes_per_date_index_stages(tmp_path: Path) -> None:
+    journal_dir = tmp_path / "journals"
+    journal_dir.mkdir()
+    path = journal_dir / "july30.md"
+    path.write_text("隰县小西天与临汾创客交流。" * 30, encoding="utf-8")
+    manifest = {
+        "entries": {
+            "july30": {
+                "slug": "july30",
+                "status": "complete",
+                "title": "基地车日记｜2026.07.30 隰县到临汾",
+                "date": "2026-07-30",
+                "dates": ["2026-07-30"],
+                "file": str(path),
+                "fetched_at": "2026-08-06T00:00:00Z",
+            }
+        }
+    }
+    (journal_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+    )
+    store = MemoryStore(
+        persist_dir=str(tmp_path / "chroma"),
+        journal_dir=str(journal_dir),
+        use_v3=True,
+    )
+
+    july30 = store.health()["coverage"]["2026-07-30"]
+    assert july30 == {
+        "discovered": True,
+        "fetched": True,
+        "validated": True,
+        "indexed": True,
+        "slug": "july30",
+    }

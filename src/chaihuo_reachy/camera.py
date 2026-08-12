@@ -19,6 +19,7 @@ import platform
 import shutil
 import subprocess
 import time
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -48,7 +49,10 @@ def visual_quality_issue(jpeg: bytes) -> str | None:
         return "画面太暗了，我现在看不清。"
     if mean > 238 or bright_ratio > 0.85:
         return "画面过曝了，我现在看不清。"
-    if std < 10 or focus < 15:
+    # Blur gate: Laplacian variance is naturally low (<15) for static/low
+    # texture scenes like a car interior — only report blur when BOTH
+    # contrast and focus are extremely low, otherwise the VLM judges.
+    if std < 4 and focus < 4:
         return "镜头可能被挡住或没有对准场景，画面太模糊了，我看不清。"
     return None
 
@@ -171,10 +175,27 @@ def _find_reachy_camera_index_macos() -> int | None:
 
 
 def _find_reachy_camera_index_linux() -> int | str | None:
-    """Find the Reachy Mini camera on Linux using v4l2-ctl."""
+    """Find the Reachy Mini camera on Linux.
+
+    Tries sysfs names first (no v4l2-ctl dependency — the video node number
+    is unstable across reboots, e.g. /dev/video0 vs /dev/video1), then the
+    v4l2-ctl probe, then /dev/v4l/by-id symlinks.
+    """
     import glob
     import os
 
+    # 1) sysfs name match — robust, no external tooling
+    for node in sorted(glob.glob("/sys/class/video4linux/video*")):
+        try:
+            name = Path(node, "name").read_text(encoding="utf-8").strip().lower()
+            if "reachy" in name:
+                dev = f"/dev/{Path(node).name}"
+                logger.info("Found Reachy camera (sysfs): %s", dev)
+                return dev
+        except Exception:
+            pass
+
+    # 2) v4l2-ctl probe (when installed)
     for video_dev in sorted(glob.glob("/dev/video*")):
         try:
             result = subprocess.run(

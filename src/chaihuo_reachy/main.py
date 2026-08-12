@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -18,7 +19,11 @@ import numpy as np
 
 from chaihuo_reachy.camera import find_reachy_camera
 from chaihuo_reachy.config import Config, load_config
-from chaihuo_reachy.dashboard import ChatMessageStore, DashboardHub, run_websocket_session
+from chaihuo_reachy.dashboard import (
+    ChatMessageStore,
+    DashboardHub,
+    run_websocket_session,
+)
 from chaihuo_reachy.engine import ConversationEngine
 from chaihuo_reachy import daemon_runtime
 from chaihuo_reachy.backends.interfaces import (
@@ -316,15 +321,16 @@ function onMsg(m){
     // Update location display
     if(m.location){
       var loc=m.location;
-      var srcLabel={'gpsd':'🛰 GPS卫星','browser':'📱 设备定位','manual':'📍 手动设置','unavailable':'❌ 无信号'};
+      var srcLabel={'gpsd':'🛰 GPS卫星','browser':'📱 设备定位','amap_ip':'🌐 高德IP城市定位','session_user':'📍 会话位置','configured_fallback':'📌 默认城市','manual':'📍 手动设置','unavailable':'❌ 无信号'};
       $('locSrc').textContent=srcLabel[loc.source]||loc.source;
       $('locSrc').className='val '+(loc.source==='gpsd'?'ok':loc.source==='unavailable'?'err':'');
-      var detail='坐标: '+loc.lat.toFixed(4)+'°, '+loc.lon.toFixed(4)+'°';
+      var detail=(loc.lat!=null&&loc.lon!=null)?('坐标: '+loc.lat.toFixed(4)+'°, '+loc.lon.toFixed(4)+'°'):'精度: '+(loc.precision==='city'?'城市级':'未提供坐标');
       if(loc.accuracy_m!=null){detail+=' (精度 ±'+loc.accuracy_m.toFixed(0)+'m)';}
       if(loc.address){detail+='<br>'+esc(loc.address);}
       if(loc.altitude_m!=null){detail+='<br>海拔: '+loc.altitude_m.toFixed(0)+'m';}
       if(loc.speed_kmh!=null&&loc.speed_kmh>0.5){detail+='<br>速度: '+loc.speed_kmh.toFixed(1)+'km/h';}
-      detail+='<br><span style="color:var(--m);font-size:.6rem">更新: '+new Date(loc.timestamp*1000).toLocaleTimeString()+'</span>';
+      var updated=loc.observed_at?new Date(loc.observed_at):(loc.timestamp?new Date(loc.timestamp*1000):null);
+      if(updated)detail+='<br><span style="color:var(--m);font-size:.6rem">更新: '+updated.toLocaleTimeString()+'</span>';
       $('locDetail').innerHTML=detail;
     }
     // Update ASR diagnostics
@@ -547,11 +553,19 @@ def setup_logging(verbose: bool = False) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    for lib in ("httpx", "websockets", "chromadb", "urllib3", "sounddevice", "dashscope"):
+    for lib in (
+        "httpx",
+        "websockets",
+        "chromadb",
+        "urllib3",
+        "sounddevice",
+        "dashscope",
+    ):
         logging.getLogger(lib).setLevel(logging.WARNING)
 
 
 # ── MJPEG camera stream helper ──────────────────────────────────────────────
+
 
 class _MJPEGStream:
     """Thread-safe MJPEG streamer — supports both SDK camera backend and OpenCV."""
@@ -602,7 +616,9 @@ class _MJPEGStream:
             target=self._capture_loop, daemon=True, name="mjpeg-capture"
         )
         self._thread.start()
-        logger.info("MJPEG stream started: %dx%d@%d", self._width, self._height, self._fps)
+        logger.info(
+            "MJPEG stream started: %dx%d@%d", self._width, self._height, self._fps
+        )
         return True
 
     def stop(self) -> None:
@@ -713,6 +729,7 @@ async def generate_mjpeg(stream: _MJPEGStream):
 
 # ── Dashboard runner ─────────────────────────────────────────────────────────
 
+
 async def run_dashboard(
     cfg: Config,
     *,
@@ -722,10 +739,16 @@ async def run_dashboard(
     camera_backend: "CameraBackend | None" = None,
     reachy: "ReachyMini | None" = None,
     motion: "MotionController | None" = None,
+    beat_dance: Any | None = None,
     manage_reachy_lifecycle: bool = False,
 ) -> None:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-    from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+    from fastapi.responses import (
+        HTMLResponse,
+        JSONResponse,
+        Response,
+        StreamingResponse,
+    )
     import uvicorn
 
     app = FastAPI(title="皮皮虾 Dashboard")
@@ -745,6 +768,7 @@ async def run_dashboard(
         audio_backend=audio_backend,
         camera_backend=camera_backend,
         motion=motion,
+        beat_dance=beat_dance,
     )
 
     mjpeg = _MJPEGStream(camera_backend=camera_backend, fps=10)
@@ -763,8 +787,12 @@ async def run_dashboard(
         hub.publish(msg)
 
     engine.on_state_change(lambda s: broadcast({"type": "state", "state": s}))
-    engine.on_transcript(lambda t, f: broadcast({"type": "transcript", "text": t, "final": f}))
-    engine.on_asr_status(lambda status: broadcast({"type": "asr_status", "status": status}))
+    engine.on_transcript(
+        lambda t, f: broadcast({"type": "transcript", "text": t, "final": f})
+    )
+    engine.on_asr_status(
+        lambda status: broadcast({"type": "asr_status", "status": status})
+    )
     engine.on_emotion(lambda e: broadcast({"type": "emotion", "emotion": e}))
 
     def on_turn_event(event: dict[str, Any]) -> None:
@@ -782,16 +810,20 @@ async def run_dashboard(
         elif event_type == "chat_message_delta":
             message = chat.append_delta(turn_id, str(event.get("delta") or ""))
             if message:
-                broadcast({
-                    "type": "chat_message_delta",
-                    "message_id": message["id"],
-                    "turn_id": turn_id,
-                    "delta": str(event.get("delta") or ""),
-                })
+                broadcast(
+                    {
+                        "type": "chat_message_delta",
+                        "message_id": message["id"],
+                        "turn_id": turn_id,
+                        "delta": str(event.get("delta") or ""),
+                    }
+                )
         elif event_type == "turn_status":
             status_value = str(event.get("status") or "")
             message = chat.set_status(turn_id, status_value)
-            broadcast({"type": "turn_status", "turn_id": turn_id, "status": status_value})
+            broadcast(
+                {"type": "turn_status", "turn_id": turn_id, "status": status_value}
+            )
             if message:
                 broadcast({"type": "chat_message_upsert", "message": message})
         elif event_type == "turn_final":
@@ -814,13 +846,15 @@ async def run_dashboard(
         if message:
             broadcast({"type": "chat_message_upsert", "message": message})
         # Kept for older Dashboard clients during the protocol transition.
-        broadcast({
-            "type": "snapshot_result",
-            "capture_id": capture_id,
-            "url": f"/captures/{capture_id}",
-            "label": label,
-            "jpeg": base64.b64encode(jpeg).decode(),  # frontend expects this
-        })
+        broadcast(
+            {
+                "type": "snapshot_result",
+                "capture_id": capture_id,
+                "url": f"/captures/{capture_id}",
+                "label": label,
+                "jpeg": base64.b64encode(jpeg).decode(),  # frontend expects this
+            }
+        )
 
     engine.on_turn_event(on_turn_event)
     engine.on_snapshot(on_snapshot)
@@ -829,6 +863,7 @@ async def run_dashboard(
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:
         await ws.accept()
+
         def _snapshot() -> list[dict[str, Any]]:
             runtime = {**engine.runtime_status(), **sdk_status}
             return [
@@ -912,9 +947,14 @@ async def run_dashboard(
                 if -90 <= lat <= 90 and -180 <= lon <= 180:
                     if engine._location is not None:
                         engine._location.set_browser_position(
-                            lat, lon,
-                            accuracy_m=float(accuracy) if accuracy is not None else None,
-                            altitude_m=float(altitude) if altitude is not None else None,
+                            lat,
+                            lon,
+                            accuracy_m=float(accuracy)
+                            if accuracy is not None
+                            else None,
+                            altitude_m=float(altitude)
+                            if altitude is not None
+                            else None,
                             heading_deg=float(heading) if heading is not None else None,
                             speed_kmh=float(speed) * 3.6 if speed is not None else None,
                         )
@@ -926,17 +966,21 @@ async def run_dashboard(
                         engine._location.set_manual(lat, lon)
                         pos = engine._location.latest_position
                         if pos:
-                            await client.send_json({
-                                "type": "runtime_status",
-                                **engine.runtime_status(),
-                                **sdk_status,
-                            })
+                            await client.send_json(
+                                {
+                                    "type": "runtime_status",
+                                    **engine.runtime_status(),
+                                    **sdk_status,
+                                }
+                            )
                         broadcast({"type": "location_updated", "lat": lat, "lon": lon})
                 else:
-                    await client.send_json({
-                        "type": "error",
-                        "message": "经纬度范围无效（lat: -90~90, lon: -180~180）",
-                    })
+                    await client.send_json(
+                        {
+                            "type": "error",
+                            "message": "经纬度范围无效（lat: -90~90, lon: -180~180）",
+                        }
+                    )
             elif event_type == "snapshot":
                 asyncio.create_task(
                     engine.process_text(
@@ -947,10 +991,48 @@ async def run_dashboard(
                 )
             # ── Motion commands ──
             elif event_type == "motion_dance":
+                if getattr(engine, "_dance_loop_active", False):
+                    broadcast(
+                        {"type": "error", "message": "节拍连跳进行中，请先点击停止"}
+                    )
+                    return
+                style = data.get("style", "happy")
                 if motion:
-                    style = data.get("style", "happy")
-                    broadcast({"type": "motion_status", "action": "dancing", "style": style})
+                    logger.info("🕹 Dashboard 触发舞蹈: style=%s", style)
+                    broadcast(
+                        {"type": "motion_status", "action": "dancing", "style": style}
+                    )
                     asyncio.create_task(_run_motion(motion.dance(style)))
+                else:
+                    logger.warning(
+                        "motion_dance 事件被忽略: motion 控制器不可用 (style=%s)", style
+                    )
+            elif event_type == "motion_dance_loop":
+                # 无限节拍连跳：播放/停止切换；跳舞期间语音挂起
+                action = data.get("action", "")
+                if action == "play":
+                    if getattr(engine, "_dance_loop_active", False):
+                        return
+                    if beat_dance is None:
+                        await client.send_json(
+                            {"type": "error", "message": "节拍连跳未启用"}
+                        )
+                        return
+                    if motion is not None and motion.is_busy:
+                        await client.send_json(
+                            {
+                                "type": "error",
+                                "message": "机器人正在执行其他动作，请稍后",
+                            }
+                        )
+                        return
+                    reply = await engine.start_beat_dance()
+                    broadcast({"type": "dance_loop", "active": True})
+                    if reply and "开始跳舞" not in reply:
+                        await client.send_json({"type": "error", "message": reply})
+                elif action == "stop":
+                    await engine.stop_beat_dance()
+                    broadcast({"type": "dance_loop", "active": False})
             elif event_type == "motion_nod":
                 if motion:
                     broadcast({"type": "motion_status", "action": "nodding"})
@@ -997,6 +1079,7 @@ async def run_dashboard(
     async def favicon():
         # Return 204 No Content to silence the browser's auto favicon 404
         from fastapi.responses import Response
+
         return Response(status_code=204)
 
     @app.get("/")
@@ -1009,34 +1092,40 @@ async def run_dashboard(
     @app.get("/status")
     async def status() -> JSONResponse:
         journal_health = engine._journal_fetcher.health()
-        return JSONResponse({
-            **engine.runtime_status(),
-            **sdk_status,
-            "camera_device": str(cfg.camera_device),
-            "camera_stream": mjpeg.is_active,
-            "history_turns": len(engine._conversation_history) // 2,
-            "memory_docs": engine._memory.count() if engine._memory else 0,
-            "journal": journal_health,
-            "journal_complete_ratio": (
-                journal_health["complete"] / journal_health["expected"]
-                if journal_health["expected"]
-                else 0.0
-            ),
-            "camera_backend": camera_backend.backend_name if camera_backend else "unavailable",
-            "front_frame_age_s": mjpeg.frame_age_s,
-            "rear_camera_configured": bool(
-                cfg.ezviz_app_key and cfg.ezviz_app_secret and cfg.ezviz_device_serial
-            ),
-            "chat_messages": chat.message_count,
-            "chat_captures": chat.capture_count,
-            "volume": (
-                playback_percent_from_gain(engine._audio.volume)
-                if engine._audio
-                else 0
-            ),
-            "wake_word_enabled": cfg.enable_wake_word,
-            "ws_subscribers": hub.subscriber_count,
-        })
+        return JSONResponse(
+            {
+                **engine.runtime_status(),
+                **sdk_status,
+                "camera_device": str(cfg.camera_device),
+                "camera_stream": mjpeg.is_active,
+                "history_turns": len(engine._conversation_history) // 2,
+                "memory_docs": engine._memory.count() if engine._memory else 0,
+                "journal": journal_health,
+                "journal_complete_ratio": (
+                    journal_health["complete"] / journal_health["expected"]
+                    if journal_health["expected"]
+                    else 0.0
+                ),
+                "camera_backend": camera_backend.backend_name
+                if camera_backend
+                else "unavailable",
+                "front_frame_age_s": mjpeg.frame_age_s,
+                "rear_camera_configured": bool(
+                    cfg.ezviz_app_key
+                    and cfg.ezviz_app_secret
+                    and cfg.ezviz_device_serial
+                ),
+                "chat_messages": chat.message_count,
+                "chat_captures": chat.capture_count,
+                "volume": (
+                    playback_percent_from_gain(engine._audio.volume)
+                    if engine._audio
+                    else 0
+                ),
+                "wake_word_enabled": cfg.enable_wake_word,
+                "ws_subscribers": hub.subscriber_count,
+            }
+        )
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
@@ -1047,21 +1136,25 @@ async def run_dashboard(
             app_version = version("chaihuo-reachy")
         except Exception:
             app_version = "unknown"
-        return JSONResponse({
-            "status": "ok",
-            "version": app_version,
-            "started_at": started_at,
-            "sdk_connected": bool(sdk_status.get("sdk_connected")),
-            "robot_ready": bool(sdk_status.get("robot_ready")),
-            "robot_status": sdk_status.get("robot_status", "degraded"),
-            "daemon_health": sdk_status.get("daemon_health", "unavailable"),
-            "daemon_owner": sdk_status.get("daemon_owner", "none"),
-            "daemon_error": sdk_status.get("daemon_error"),
-            "audio_backend": (
-                engine._audio.backend_name if engine._audio is not None else "unavailable"
-            ),
-            "state": engine._state,
-        })
+        return JSONResponse(
+            {
+                "status": "ok",
+                "version": app_version,
+                "started_at": started_at,
+                "sdk_connected": bool(sdk_status.get("sdk_connected")),
+                "robot_ready": bool(sdk_status.get("robot_ready")),
+                "robot_status": sdk_status.get("robot_status", "degraded"),
+                "daemon_health": sdk_status.get("daemon_health", "unavailable"),
+                "daemon_owner": sdk_status.get("daemon_owner", "none"),
+                "daemon_error": sdk_status.get("daemon_error"),
+                "audio_backend": (
+                    engine._audio.backend_name
+                    if engine._audio is not None
+                    else "unavailable"
+                ),
+                "state": engine._state,
+            }
+        )
 
     @app.get("/captures/{capture_id}")
     async def capture(capture_id: str) -> Response:
@@ -1110,15 +1203,15 @@ async def run_dashboard(
             try:
                 image_bytes = base64.b64decode(req.image_base64)
             except Exception:
-                return JSONResponse(
-                    {"error": "image_base64 解码失败"}, status_code=400
-                )
+                return JSONResponse({"error": "image_base64 解码失败"}, status_code=400)
 
         result = await engine.process_text(req.text, image_bytes=image_bytes)
-        return JSONResponse({
-            **result,
-            "history_turns": len(engine._conversation_history) // 2,
-        })
+        return JSONResponse(
+            {
+                **result,
+                "history_turns": len(engine._conversation_history) // 2,
+            }
+        )
 
     # ── Journal sync endpoint ───────────────────────────────────────
     @app.post("/debug/sync-journals")
@@ -1131,13 +1224,15 @@ async def run_dashboard(
             cache_dir=cfg.journal_cache_dir,
         )
         results = await fetcher.sync(memory_store=engine._memory)
-        return JSONResponse({
-            "ok": True,
-            "total": len(results),
-            "new": sum(1 for r in results if r.get("new")),
-            "cached": sum(1 for r in results if not r.get("new")),
-            "memory_docs": engine._memory.count() if engine._memory else 0,
-        })
+        return JSONResponse(
+            {
+                "ok": True,
+                "total": len(results),
+                "new": sum(1 for r in results if r.get("new")),
+                "cached": sum(1 for r in results if not r.get("new")),
+                "memory_docs": engine._memory.count() if engine._memory else 0,
+            }
+        )
 
     # ── Search toggle endpoint ──────────────────────────────────────
     class SearchToggleRequest(BaseModel):
@@ -1164,49 +1259,82 @@ async def run_dashboard(
     async def _broadcast_audio_level() -> None:
         """Poll audio level and camera frame age via WebSocket (~2 Hz)."""
         import math as _math
+
         while True:
             await asyncio.sleep(0.5)
             if engine._audio is not None:
                 rms = engine._audio.capture_rms
                 db = round(20.0 * _math.log10(max(rms, 1e-8)), 1)
-                broadcast({
-                    "type": "audio_level",
-                    "db": db,
-                    "rms": round(rms, 4),
-                    "frame_age_s": round(mjpeg.frame_age_s, 1) if mjpeg.frame_age_s is not None else None,
-                })
+                broadcast(
+                    {
+                        "type": "audio_level",
+                        "db": db,
+                        "rms": round(rms, 4),
+                        "frame_age_s": round(mjpeg.frame_age_s, 1)
+                        if mjpeg.frame_age_s is not None
+                        else None,
+                    }
+                )
 
     asyncio.create_task(_broadcast_audio_level())
 
     # ── Auto-sync journals periodically (background, non-blocking) ──
     async def _auto_sync_journals() -> None:
         from chaihuo_reachy.memory import JournalFetcher
+        from chaihuo_reachy.memory.journal_fetcher import journal_sync_lock
 
         interval = max(0, cfg.journal_auto_sync_interval_minutes) * 60
         while True:
-            fetcher = JournalFetcher(
-                listing_url=cfg.journal_url,
-                cache_dir=cfg.journal_cache_dir,
-            )
-            try:
-                results = await fetcher.sync(memory_store=engine._memory)
-                new_count = sum(1 for r in results if r.get("new"))
-                if new_count:
-                    print(f"  📝 日记自动同步: {new_count} 篇新日记已索引 (共 {len(results)} 篇)")
-                elif interval > 0:
-                    logger.debug("日记自动同步: 无新内容 (%d 篇)", len(results))
-                else:
-                    print(f"  📝 日记: {len(results)} 篇已缓存")
-            except Exception:
-                logger.warning("Journal auto-sync failed", exc_info=True)
+            # Respect the cross-process flock (systemd timer sync, engine's
+            # per-answer sync): skip this tick when another sync owns it.
+            with journal_sync_lock(cfg.journal_cache_dir) as acquired:
+                if acquired:
+                    fetcher = JournalFetcher(
+                        listing_url=cfg.journal_url,
+                        cache_dir=cfg.journal_cache_dir,
+                    )
+                    try:
+                        results = await fetcher.sync(memory_store=engine._memory)
+                        new_count = sum(1 for r in results if r.get("new"))
+                        if new_count:
+                            print(
+                                f"  📝 日记自动同步: {new_count} 篇新日记已索引 "
+                                f"(共 {len(results)} 篇)"
+                            )
+                        elif interval > 0:
+                            logger.debug("日记自动同步: 无新内容 (%d 篇)", len(results))
+                        else:
+                            print(f"  📝 日记: {len(results)} 篇已缓存")
+                    except Exception:
+                        logger.warning("Journal auto-sync failed", exc_info=True)
             if interval <= 0:
                 break  # 0 = one-shot only at startup
             await asyncio.sleep(interval)
 
     asyncio.create_task(_auto_sync_journals())
 
-    config = uvicorn.Config(app, host="0.0.0.0", port=cfg.dashboard_port, log_level="warning")
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=cfg.dashboard_port,
+        log_level="warning",
+        # A browser WebSocket must not keep Ctrl+C in uvicorn's drain phase
+        # indefinitely.  Our own finally chain then sleeps the robot, closes
+        # ALSA and terminates the owned SDK daemon.
+        timeout_graceful_shutdown=2,
+    )
     server = uvicorn.Server(config)
+
+    uvicorn_handle_exit = server.handle_exit
+
+    def _handle_server_exit(signum: int, frame: Any) -> None:
+        # uvicorn temporarily replaces our process SIGINT handler. Arm the
+        # same hard backstop at the instant it receives the first signal,
+        # rather than waiting for server.serve() to return.
+        _arm_shutdown_backstop(owned_daemon_state_file=cfg.daemon_state_file)
+        uvicorn_handle_exit(signum, frame)
+
+    server.handle_exit = _handle_server_exit  # type: ignore[method-assign]
 
     async def _watch_stop_event() -> None:
         if stop_event is None:
@@ -1218,7 +1346,7 @@ async def run_dashboard(
     stop_task = asyncio.create_task(_watch_stop_event())
     audio_info = engine._audio.resolved_info if engine._audio else None
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  🚐 皮皮虾 Dashboard 已启动")
     print(f"  🌐 http://localhost:{cfg.dashboard_port}")
     if audio_info:
@@ -1233,11 +1361,15 @@ async def run_dashboard(
                 f"  🎤 [{audio_info.input_index}] {audio_info.input_name} "
                 f"({audio_info.max_input_channels}in/{audio_info.max_output_channels}out)"
             )
-    print(f"  🔌 SDK: {'connected' if sdk_status.get('sdk_connected') else 'standalone'}")
-    print(f"  📷 Reachy Mini Camera ({'MJPEG stream' if mjpeg_ok else 'snapshot only'})")
+    print(
+        f"  🔌 SDK: {'connected' if sdk_status.get('sdk_connected') else 'standalone'}"
+    )
+    print(
+        f"  📷 Reachy Mini Camera ({'MJPEG stream' if mjpeg_ok else 'snapshot only'})"
+    )
     print(f"  🔊 音量控制: PCM 增益")
     print(f"  🎤 唤醒词: {'开启' if cfg.enable_wake_word else '关闭'}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"  打开浏览器查看 Dashboard，说 '皮皮虾' 唤醒我")
     print(f"  Ctrl+C 退出\n")
 
@@ -1246,6 +1378,7 @@ async def run_dashboard(
     except KeyboardInterrupt:
         print("\n👋 皮皮虾下线！")
     finally:
+        _arm_shutdown_backstop()
         if manage_reachy_lifecycle:
             await _sleep_reachy_on_shutdown(reachy, cfg)
         mjpeg.stop()
@@ -1263,6 +1396,7 @@ async def run_dashboard(
 
 # ── Hardware diagnostic ─────────────────────────────────────────────────────
 
+
 async def run_diagnostic(cfg: Config) -> None:
     import sounddevice as sd
     from chaihuo_reachy.audio import AudioDeviceResolutionError, resolve_audio_device
@@ -1275,7 +1409,9 @@ async def run_diagnostic(cfg: Config) -> None:
     devices = sd.query_devices()
     for i, d in enumerate(devices):
         marker = " ← Reachy Mini!" if "reachy" in d["name"].lower() else ""
-        print(f"  [{i}] {d['name']} (in={d['max_input_channels']}, out={d['max_output_channels']}){marker}")
+        print(
+            f"  [{i}] {d['name']} (in={d['max_input_channels']}, out={d['max_output_channels']}){marker}"
+        )
 
     try:
         resolved = resolve_audio_device(
@@ -1339,6 +1475,7 @@ async def run_diagnostic(cfg: Config) -> None:
     print("\n🌐 百炼 API:")
     try:
         from chaihuo_reachy.bailian import BailianLLMClient
+
         async with BailianLLMClient(cfg) as llm:
             async for _ in llm.chat_stream([{"role": "user", "content": "OK"}]):
                 pass
@@ -1348,6 +1485,7 @@ async def run_diagnostic(cfg: Config) -> None:
 
     try:
         from chaihuo_reachy.bailian import BailianTTSClient
+
         chunks: list[bytes] = []
         tts = BailianTTSClient(cfg, on_audio=lambda b, sr: chunks.append(b))
         await tts.open()
@@ -1357,12 +1495,34 @@ async def run_diagnostic(cfg: Config) -> None:
     except Exception as e:
         print(f"   ❌ TTS: {e}")
 
-    print(f"\n{'='*60}")
+    print("\n🗣️ 本地唤醒词 (KWS):")
+    if cfg.enable_wake_word and cfg.wake_engine == "local":
+        from chaihuo_reachy.wake_word import WakeWordDetector, WakeWordUnavailableError
+
+        try:
+            detector = WakeWordDetector(cfg)
+            detector.self_check()
+            print(
+                f"   ✅ KWS 就绪: model={cfg.kws_model_dir} "
+                f"threshold={cfg.kws_threshold} score={cfg.kws_score}"
+            )
+            print("   说 '皮皮虾' 测试唤醒")
+        except WakeWordUnavailableError as e:
+            print(f"   ⚠️ 本地 KWS 不可用(将回退云端唤醒): {e}")
+        except Exception as e:
+            print(f"   ⚠️ 本地 KWS 异常(将回退云端唤醒): {type(e).__name__}: {e}")
+    elif cfg.wake_engine == "cloud":
+        print("   ℹ️ 云端 ASR 文本匹配唤醒 (REACHY_WAKE_ENGINE=cloud)")
+    else:
+        print("   ℹ️ 唤醒词已禁用")
+
+    print(f"\n{'=' * 60}")
     print("  诊断完成！uv run chaihuo-reachy dashboard")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
+
 
 def _daemon_hosts(cfg: Config) -> list[str]:
     """Return the configured daemon target without probing unrelated daemons."""
@@ -1393,18 +1553,14 @@ async def _connect_reachy_once(
 ):
     """Connect without blocking the Dashboard event loop."""
     connection_mode = (
-        "localhost_only"
-        if host in {"localhost", "127.0.0.1", "::1"}
-        else "network"
+        "localhost_only" if host in {"localhost", "127.0.0.1", "::1"} else "network"
     )
     return await asyncio.to_thread(
         reachy_cls,
         host=host,
         port=cfg.daemon_port,
         connection_mode=connection_mode,
-        media_backend=(
-            "local" if cfg.media_backend != "no_media" else "no_media"
-        ),
+        media_backend=("local" if cfg.media_backend != "no_media" else "no_media"),
         spawn_daemon=False,
         use_sim=cfg.daemon_simulation,
         timeout=_DAEMON_CONNECT_TIMEOUT_S,
@@ -1428,9 +1584,13 @@ def _resolve_daemon_serial_port(cfg: Config) -> str:
             raise RuntimeError(
                 f"配置串口不存在，发现多个候选串口: {', '.join(map(str, candidates))}"
             )
-        raise RuntimeError(f"配置串口不存在且未发现 /dev/cu.usbmodem* 设备: {configured}")
+        raise RuntimeError(
+            f"配置串口不存在且未发现 /dev/cu.usbmodem* 设备: {configured}"
+        )
     if len(candidates) > 1:
-        raise RuntimeError(f"未配置串口，发现多个候选串口: {', '.join(map(str, candidates))}")
+        raise RuntimeError(
+            f"未配置串口，发现多个候选串口: {', '.join(map(str, candidates))}"
+        )
     if not candidates:
         raise RuntimeError("未配置串口且未发现 /dev/cu.usbmodem* 设备")
     return str(candidates[0])
@@ -1447,6 +1607,18 @@ def _spawn_sdk_daemon_process(cfg: Config, resolved_serial_port: str | None = No
     import subprocess
 
     executable = shutil.which("reachy-mini-daemon")
+    if not executable:
+        # Non-interactive SSH/nohup launches often do not inherit the venv's
+        # ``bin`` directory in PATH even though this application itself is
+        # running from that venv.  The SDK daemon is installed beside the
+        # current Python interpreter, so resolve that deterministic sibling
+        # before declaring the runtime unavailable.
+        # Do not resolve the Python symlink: venv/bin/python commonly points
+        # to /usr/bin/python, while the console script we need remains in the
+        # original venv/bin directory.
+        venv_daemon = Path(sys.executable).with_name("reachy-mini-daemon")
+        if venv_daemon.is_file() and os.access(venv_daemon, os.X_OK):
+            executable = str(venv_daemon)
     if not executable:
         raise RuntimeError("reachy-mini-daemon executable was not found")
     command = [executable]
@@ -1566,9 +1738,7 @@ async def _daemon_backend_error(host: str, port: int, cfg: Config | None = None)
 
     try:
         async with httpx.AsyncClient(timeout=0.5) as client:
-            response = await client.get(
-                f"http://{host}:{port}/api/daemon/status"
-            )
+            response = await client.get(f"http://{host}:{port}/api/daemon/status")
         if response.status_code != 200:
             return f"daemon 健康检查返回 HTTP {response.status_code}"
         payload = response.json()
@@ -1629,9 +1799,8 @@ async def _sleep_reachy_on_shutdown(reachy: Any | None, cfg: Config) -> bool:
     """Put the robot in its safe resting pose before releasing the daemon."""
     if reachy is None or not cfg.auto_sleep:
         return True
-    if (
-        getattr(reachy, "_chaihuo_robot_slept", False)
-        or getattr(reachy, "_chaihuo_robot_sleeping", False)
+    if getattr(reachy, "_chaihuo_robot_slept", False) or getattr(
+        reachy, "_chaihuo_robot_sleeping", False
     ):
         return True
     daemon_process = getattr(reachy, "_chaihuo_daemon_process", None)
@@ -1687,7 +1856,9 @@ async def _recover_owned_daemon(cfg: Config) -> bool:
     return stopped
 
 
-def _degraded_sdk_status(cfg: Config, reason: str, *, owner: str | None = None) -> dict[str, Any]:
+def _degraded_sdk_status(
+    cfg: Config, reason: str, *, owner: str | None = None
+) -> dict[str, Any]:
     return {
         "sdk_connected": False,
         "mode": "standalone_degraded",
@@ -1771,9 +1942,15 @@ async def _try_connect_daemon_impl(cfg: Config) -> tuple:
 
     mode = str(cfg.daemon_mode or "auto").strip().lower()
     if mode not in {"auto", "connect", "spawn"}:
-        return (None, None, None, None, _degraded_sdk_status(
-            cfg, f"无效的 REACHY_DAEMON_MODE: {cfg.daemon_mode}"
-        ))
+        return (
+            None,
+            None,
+            None,
+            None,
+            None,
+            _degraded_sdk_status(cfg, f"无效的 REACHY_DAEMON_MODE: {cfg.daemon_mode}"),
+        )
+    from chaihuo_reachy.beat_dance import BeatDanceController
 
     # ── Strategy 1: connect without assuming ownership ───────────────
     terminal_error = ""
@@ -1797,7 +1974,12 @@ async def _try_connect_daemon_impl(cfg: Config) -> tuple:
         and await _daemon_port_is_occupied(cfg)
     ):
         terminal_error = "本机 daemon 端口已被外部或异常进程占用，auto 模式不会接管"
-    if reachy is None and not terminal_error and mode != "connect" and can_spawn_locally:
+    if (
+        reachy is None
+        and not terminal_error
+        and mode != "connect"
+        and can_spawn_locally
+    ):
         # ── Strategy 2: spawn once, then wait for strict readiness ──
         logger.info("未发现健康的本机 daemon，正在拉起 Reachy Mini 进程...")
         try:
@@ -1838,11 +2020,15 @@ async def _try_connect_daemon_impl(cfg: Config) -> tuple:
             if mode == "connect":
                 terminal_error = "connect 模式下未发现健康 daemon"
             elif not can_spawn_locally:
-                terminal_error = "远程 daemon 不可用；auto/spawn 不会在远程地址拉起本地进程"
+                terminal_error = (
+                    "远程 daemon 不可用；auto/spawn 不会在远程地址拉起本地进程"
+                )
             else:
                 terminal_error = "未发现健康 daemon"
         logger.error("Daemon 不可用 — Dashboard 将以降级模式启动：%s", terminal_error)
-        return (None, None, None, None, _degraded_sdk_status(cfg, terminal_error))
+        # 6-tuple to match _start_dashboard/_start_voice_loop unpacking
+        # (beat_dance slot was missing → ValueError on daemon-less boot).
+        return (None, None, None, None, None, _degraded_sdk_status(cfg, terminal_error))
 
     # Explicit ownership marker: only a daemon started by this invocation
     # may be terminated when Ctrl+C is received.
@@ -1868,7 +2054,12 @@ async def _try_connect_daemon_impl(cfg: Config) -> tuple:
     try:
         audio_backend = create_audio_backend(cfg, reachy.media_manager)
         camera_backend = create_camera_backend(cfg, reachy.media_manager)
-        motion = MotionController(reachy) if cfg.dance_enabled else None
+        motion = MotionController(reachy, cfg) if cfg.dance_enabled else None
+        beat_dance = (
+            BeatDanceController(reachy, cfg)
+            if cfg.dance_enabled and cfg.beat_dance_enabled
+            else None
+        )
 
         if cfg.wobbling_enabled and motion:
             motion.enable_wobbling()
@@ -1880,21 +2071,26 @@ async def _try_connect_daemon_impl(cfg: Config) -> tuple:
     sdk_status = {
         "sdk_connected": True,
         "mode": "daemon_connected",
-        "media_backend": "sdk_gstreamer" if cfg.media_backend != "no_media" else "direct",
+        "media_backend": "sdk_gstreamer"
+        if cfg.media_backend != "no_media"
+        else "direct",
         "robot_ready": robot_ready,
         "robot_status": "ready" if robot_ready else "degraded",
         "daemon_health": "healthy",
         "daemon_owner": (
-            "owned" if daemon_process is not None or _daemon_owner(cfg) == "owned"
+            "owned"
+            if daemon_process is not None or _daemon_owner(cfg) == "owned"
             else "external"
         ),
         "daemon_error": None,
-        "daemon_host": getattr(getattr(reachy, "client", None), "host", cfg.daemon_host),
+        "daemon_host": getattr(
+            getattr(reachy, "client", None), "host", cfg.daemon_host
+        ),
         "daemon_port": cfg.daemon_port,
         "serial_port": cfg.daemon_serial_port or None,
     }
     logger.info("✅ Daemon 连接成功: %s", sdk_status)
-    return (reachy, audio_backend, camera_backend, motion, sdk_status)
+    return (reachy, audio_backend, camera_backend, motion, beat_dance, sdk_status)
 
 
 async def _try_connect_daemon(cfg: Config) -> tuple:
@@ -1921,28 +2117,114 @@ async def _try_connect_daemon(cfg: Config) -> tuple:
         raise
 
 
-def main() -> None:
+# ── Graceful shutdown guarantees ────────────────────────────────────────
+#
+# Ctrl+C must never leave the XMOS sound card or the dashboard port
+# occupied, or the next launch fails with "device busy" / "port in use".
+# Three layers: the graceful finally chains below, a shutdown backstop
+# daemon thread (auto force-exit after N seconds), and a second Ctrl+C
+# that force-exits immediately.
+
+_SHUTDOWN_BACKSTOP_ARMED = threading.Event()
+_GOT_FIRST_SIGINT = threading.Event()
+
+
+def _arm_shutdown_backstop(
+    delay_s: float = 25.0,
+    *,
+    force_exit=os._exit,
+    owned_daemon_state_file: str | None = None,
+) -> None:
+    """Guarantee Ctrl+C releases the audio device and dashboard port.
+
+    Armed at the top of every shutdown finally.  If the graceful cleanup
+    chain hangs (wedged ALSA read, stuck WebSocket), the daemon thread
+    force-exits the process — the OS then releases the XMOS sound card
+    and the port, so the next launch always succeeds.  Idempotent.
+    """
+    if _SHUTDOWN_BACKSTOP_ARMED.is_set():
+        return
+    _SHUTDOWN_BACKSTOP_ARMED.set()
+
+    def _force() -> None:
+        time.sleep(delay_s)
+        logger.error("🛑 资源清理超时（%.0fs），强制退出以释放音频设备与端口", delay_s)
+        if owned_daemon_state_file:
+            try:
+                daemon_runtime.terminate_owned_state(owned_daemon_state_file)
+            except Exception:
+                logger.exception("强制退出前回收 owned daemon 失败")
+        force_exit(1)
+
+    threading.Thread(target=_force, name="shutdown-backstop", daemon=True).start()
+
+
+def _install_sigint_handler(cfg: Config) -> None:
+    """First Ctrl+C → graceful shutdown; second Ctrl+C → force exit.
+
+    The graceful finally chains sleep the robot, close the ALSA PCMs and
+    stop the owned daemon.  If that path hangs, pressing Ctrl+C again
+    force-exits so the sound card / port are never left occupied.
+    """
+
+    def _on_sigint(signum: int, frame: Any) -> None:
+        if _GOT_FIRST_SIGINT.is_set():
+            logger.error("🛑 再次 Ctrl+C，强制退出（释放音频设备与端口）")
+            os._exit(128 + signum)
+        _GOT_FIRST_SIGINT.set()
+        _arm_shutdown_backstop(owned_daemon_state_file=cfg.daemon_state_file)
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _on_sigint)
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="🚐 柴火基地车 Reachy Mini 智能助手")
-    parser.add_argument("command", nargs="?", default="dashboard",
-                        choices=["run", "dashboard", "test", "index-journals"])
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="dashboard",
+        choices=["run", "dashboard", "test", "index-journals", "sync-journals"],
+    )
     parser.add_argument("-c", "--config")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--no-wake-word", action="store_true")
-    parser.add_argument("--standalone", action="store_true", help="跳过 daemon 连接，直接用本地音频/摄像头")
+    parser.add_argument(
+        "--wake-engine",
+        choices=["local", "cloud", "off"],
+        help="唤醒词引擎: local=本地KWS, cloud=云端文本匹配, off=关闭",
+    )
+    parser.add_argument(
+        "--standalone",
+        action="store_true",
+        help="跳过 daemon 连接，直接用本地音频/摄像头",
+    )
     parser.add_argument("--target", choices=["mac", "jetson"])
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     setup_logging(args.verbose)
     cfg = load_config(args.config)
 
     if args.no_wake_word:
         cfg.enable_wake_word = False
+    if args.wake_engine == "off":
+        cfg.enable_wake_word = False
+    elif args.wake_engine:
+        cfg.wake_engine = args.wake_engine
     if args.target:
         cfg.target = args.target
 
     if cfg.target == "jetson" or os.environ.get("REACHY_TARGET") == "jetson":
         if cfg.camera_device == "auto":
-            cfg.camera_device = "/dev/video0"
+            # Video node numbers are unstable across reboots (video0/video1);
+            # resolve by name via the sysfs detector instead of hardcoding.
+            from chaihuo_reachy.camera import find_reachy_camera
+
+            cfg.camera_device = find_reachy_camera("auto")
     elif cfg.target == "mac" and cfg.daemon_host == "reachy-mini.local":
         # macOS Lite: daemon runs locally (USB-connected), not on the robot.
         # Only override the default; explicit REACHY_DAEMON_HOST wins.
@@ -1952,6 +2234,10 @@ def main() -> None:
         asyncio.run(_index_all_journals(cfg))
         return
 
+    if args.command == "sync-journals":
+        # Unattended incremental sync (systemd timer): no API key needed.
+        sys.exit(asyncio.run(_sync_journals_incremental(cfg)))
+
     if not cfg.bailian_api_key:
         print("❌ BAILIAN_API_KEY 未设置", file=sys.stderr)
         sys.exit(1)
@@ -1960,6 +2246,7 @@ def main() -> None:
     # application is deliberately not part of this process lifecycle.
     # Only skip daemon handling when --standalone is explicit.
     standalone = getattr(args, "standalone", False)
+    _install_sigint_handler(cfg)
 
     if args.command == "test":
         asyncio.run(run_diagnostic(cfg))
@@ -1996,14 +2283,65 @@ async def _index_all_journals(cfg: Config) -> None:
     )
 
 
+async def _sync_journals_incremental(cfg: Config) -> int:
+    """Incremental journal sync for unattended use; returns process exit code.
+
+    Exit 0: sync succeeded, or another sync is already running (skip), or
+    the listing is available but some entries are inaccessible (e.g. Yuque
+    401 on private entries) — the corpus stays partially cached and the
+    next tick retries them.  Exit 1: listing unavailable / hard error.
+    """
+    from chaihuo_reachy.memory import JournalFetcher, MemoryStore
+    from chaihuo_reachy.memory.journal_fetcher import journal_sync_lock
+
+    cache_dir = Path(cfg.journal_cache_dir)
+    with journal_sync_lock(cache_dir) as acquired:
+        if not acquired:
+            print("another sync in progress, skip")
+            return 0
+        store = MemoryStore(
+            persist_dir=cfg.chroma_persist_dir,
+            journal_dir=str(cache_dir),
+        )
+        fetcher = JournalFetcher(
+            listing_url=cfg.journal_url,
+            cache_dir=cache_dir,
+        )
+        try:
+            results = await fetcher.sync(memory_store=store)
+        except Exception as exc:
+            print(f"❌ 日记同步失败: {exc}", file=sys.stderr)
+            return 1
+        health = fetcher.health()
+        new_count = sum(1 for r in results if r.get("new"))
+        changed_count = sum(1 for r in results if r.get("changed"))
+        if health["complete"] < health["expected"]:
+            print(
+                f"⚠️ 日记不完整: 官方 {health['expected']} 篇, "
+                f"完整 {health['complete']} 篇 "
+                f"({health['expected'] - health['complete']} 篇暂不可访问, 下轮重试)"
+            )
+        print(
+            f"✅ 日记同步完成: 新增 {new_count}, 更新 {changed_count}; "
+            f"官方 {health['expected']} 篇, 完整 {health['complete']} 篇"
+        )
+        return 0
+
+
 async def _start_dashboard(cfg: Config, *, standalone: bool = False) -> None:
     """Start dashboard — try daemon connection first, fall back to standalone."""
     if standalone:
-        reachy = audio_backend = camera_backend = motion = None
+        reachy = audio_backend = camera_backend = motion = beat_dance = None
         sdk_status = {"sdk_connected": False, "mode": "standalone"}
     else:
-        reachy, audio_backend, camera_backend, motion, sdk_status = \
-            await _try_connect_daemon(cfg)
+        (
+            reachy,
+            audio_backend,
+            camera_backend,
+            motion,
+            beat_dance,
+            sdk_status,
+        ) = await _try_connect_daemon(cfg)
     # When running without the robot (standalone or daemon unavailable),
     # switch to the default Mac/PC audio device instead of looking for
     # the Reachy Mini sound card.
@@ -2017,9 +2355,11 @@ async def _start_dashboard(cfg: Config, *, standalone: bool = False) -> None:
             camera_backend=camera_backend,
             reachy=reachy,
             motion=motion,
+            beat_dance=beat_dance,
             manage_reachy_lifecycle=True,
         )
     finally:
+        _arm_shutdown_backstop()
         # Covers failures before run_dashboard reaches its own server finally
         # (audio/camera/memory initialisation), while the idempotency markers
         # make the normal Ctrl+C path a no-op here.
@@ -2032,8 +2372,9 @@ async def _start_voice_loop(cfg: Config, *, standalone: bool = False) -> None:
     if standalone:
         reachy = audio_backend = camera_backend = motion = None
     else:
-        reachy, audio_backend, camera_backend, motion, _ = \
-            await _try_connect_daemon(cfg)
+        reachy, audio_backend, camera_backend, motion, _, _ = await _try_connect_daemon(
+            cfg
+        )
     # When running without the robot, switch to default system audio.
     if audio_backend is None and cfg.audio_device in (None, "auto"):
         cfg.audio_device = "default"
@@ -2053,9 +2394,15 @@ async def _run_voice_loop_engine(
     reachy: Any | None = None,
 ) -> None:
     """Run the terminal voice loop with the given engine."""
+
     def on_state(state: str) -> None:
-        emoji = {"idle": "💤", "listening": "🎤", "thinking": "🤔",
-                 "speaking": "🔊", "wake_listening": "👂"}
+        emoji = {
+            "idle": "💤",
+            "listening": "🎤",
+            "thinking": "🤔",
+            "speaking": "🔊",
+            "wake_listening": "👂",
+        }
         print(f"\n  {emoji.get(state, '?')} [{state}]", end=" ", flush=True)
 
     def on_transcript(text: str, is_final: bool) -> None:
@@ -2083,6 +2430,7 @@ async def _run_voice_loop_engine(
     except KeyboardInterrupt:
         print("\n\n👋 皮皮虾下线！\n")
     finally:
+        _arm_shutdown_backstop()
         await _sleep_reachy_on_shutdown(reachy, cfg)
         await engine.stop()
         await _close_reachy_runtime(reachy)

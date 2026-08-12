@@ -12,7 +12,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, AsyncIterator
+from typing import TYPE_CHECKING, AsyncIterator, Callable
 
 import numpy as np
 
@@ -52,13 +52,17 @@ class SdkAudioIO:
 
         self._volume = 2.0  # Gain for Reachy Mini speaker
         self._play_rms = 0.0
+        self._playback_observer: Callable[[bytes, int], None] | None = None
         self._output_sr = _DEFAULT_OUTPUT_SR
         self._playing = False
         self._capture_task: asyncio.Task | None = None
         self._playback_event = threading.Event()
-        self._playback_pending = False   # True while audio has been pushed and not yet drained
+        self._playback_pending = (
+            False  # True while audio has been pushed and not yet drained
+        )
         self._playback_deadline = 0.0
-        self._capture_rms: float = 0.0   # Smoothed mic input level for diagnostics
+        self._capture_rms: float = 0.0  # Smoothed mic input level for diagnostics
+        self._last_sample_at: float = 0.0  # monotonic time of last captured sample
 
         # Resampling state (simple linear interpolation)
         self._resample_buf: np.ndarray | None = None  # leftover float32
@@ -97,6 +101,7 @@ class SdkAudioIO:
             try:
                 sample = self._mm.get_audio_sample()
                 if sample is not None and sample.size > 0:
+                    self._last_sample_at = time.monotonic()
                     # float32 (samples, 2) → int16 mono (selected channel)
                     ch_idx = min(ch, sample.shape[1] - 1) if sample.ndim > 1 else 0
                     if sample.ndim > 1:
@@ -105,7 +110,11 @@ class SdkAudioIO:
                         mono = sample.astype(np.float32)
 
                     # Update smoothed capture RMS for diagnostics
-                    rms = float(_math.sqrt(float(_math.sqrt((mono * mono).mean())))) if mono.size else 0.0
+                    rms = (
+                        float(_math.sqrt(float(_math.sqrt((mono * mono).mean()))))
+                        if mono.size
+                        else 0.0
+                    )
                     self._capture_rms = 0.9 * self._capture_rms + 0.1 * rms
 
                     i16 = (
@@ -139,9 +148,7 @@ class SdkAudioIO:
 
         try:
             # int16 → float32 normalized
-            samples = (
-                np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-            )
+            samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
             # Apply gain + soft-clip
             samples = samples * self._volume
@@ -167,6 +174,18 @@ class SdkAudioIO:
             # Update RMS
             rms = float(np.sqrt(np.mean(samples**2)))
             self._play_rms = 0.9 * self._play_rms + 0.1 * rms
+            observer = self._playback_observer
+            if observer is not None:
+                try:
+                    observer(
+                        (samples * 32767.0)
+                        .clip(-32768, 32767)
+                        .astype(np.int16)
+                        .tobytes(),
+                        self._sr,
+                    )
+                except Exception:
+                    logger.warning("playback observer failed", exc_info=True)
 
         except Exception:
             logger.exception("SDK audio playback error")
@@ -190,9 +209,9 @@ class SdkAudioIO:
         """Signal end of playback — no more audio will be queued."""
         self._playback_event.set()
         if self._playback_pending:
-            self._playback_deadline = max(
-                self._playback_deadline, time.monotonic()
-            ) + 0.3
+            self._playback_deadline = (
+                max(self._playback_deadline, time.monotonic()) + 0.3
+            )
 
     @property
     def is_playing(self) -> bool:
@@ -205,6 +224,13 @@ class SdkAudioIO:
     def capture_rms(self) -> float:
         """Smoothed RMS (0..1) of microphone input — for level diagnostics."""
         return self._capture_rms
+
+    @property
+    def last_sample_age_s(self) -> float:
+        """Seconds since the last captured audio sample (inf if never)."""
+        if not self._last_sample_at:
+            return float("inf")
+        return time.monotonic() - self._last_sample_at
 
     # ── Volume ───────────────────────────────────────────────────────
 
@@ -219,6 +245,12 @@ class SdkAudioIO:
     def play_rms(self) -> float:
         return self._play_rms
 
+    def set_playback_observer(
+        self, callback: Callable[[bytes, int], None] | None
+    ) -> None:
+        """Install a best-effort observer for SDK playback PCM."""
+        self._playback_observer = callback
+
     # ── Sample rate ──────────────────────────────────────────────────
 
     def set_output_sample_rate(self, sr: int) -> None:
@@ -232,15 +264,9 @@ class SdkAudioIO:
         return {
             "backend": self.backend_name,
             "sample_rate": self._sr,
-            "input_channels": (
-                self._mm.get_input_channels()
-                if self._mm.audio
-                else 2
-            ),
+            "input_channels": (self._mm.get_input_channels() if self._mm.audio else 2),
             "output_channels": (
-                self._mm.get_output_channels()
-                if self._mm.audio
-                else 2
+                self._mm.get_output_channels() if self._mm.audio else 2
             ),
             "output_sample_rate": self._output_sr,
             "volume": self._volume,

@@ -1,12 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from chaihuo_reachy import main as main_module
 from chaihuo_reachy.config import Config
+
+
+def test_shutdown_backstop_force_exits_once_after_delay(monkeypatch) -> None:
+    """Ctrl+C must never leave the XMOS/port occupied: the backstop
+    daemon thread force-exits the process if cleanup hangs."""
+    calls: list[int] = []
+    monkeypatch.setattr(
+        main_module, "_SHUTDOWN_BACKSTOP_ARMED", threading.Event()
+    )
+    main_module._arm_shutdown_backstop(delay_s=0.05, force_exit=calls.append)
+    # Idempotent: a second arm does not start another force-exit.
+    main_module._arm_shutdown_backstop(delay_s=0.05, force_exit=calls.append)
+    time.sleep(0.15)
+    assert calls == [1]
 
 
 def test_spawn_uses_real_hardware_mode_by_default(monkeypatch) -> None:
@@ -43,6 +59,31 @@ def test_spawn_passes_no_media_to_prevent_direct_backend_conflict(monkeypatch) -
     )
 
     assert commands[0][-1] == "--no-media"
+
+
+def test_spawn_finds_daemon_beside_venv_python_when_path_is_minimal(
+    monkeypatch, tmp_path
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    real_python = tmp_path / "python3-real"
+    real_python.touch()
+    python = bin_dir / "python3"
+    daemon = bin_dir / "reachy-mini-daemon"
+    python.symlink_to(real_python)
+    daemon.touch(mode=0o755)
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(main_module.sys, "executable", str(python))
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda command, **_kwargs: commands.append(command) or SimpleNamespace(),
+    )
+
+    main_module._spawn_sdk_daemon_process(Config(daemon_simulation=True))
+
+    assert commands == [[str(daemon), "--sim"]]
 
 
 def test_resolve_serial_recovers_only_unique_candidate(monkeypatch, tmp_path) -> None:
@@ -83,8 +124,8 @@ async def test_auto_does_not_replace_unhealthy_external_daemon(monkeypatch) -> N
     )
 
     assert result[:4] == (None, None, None, None)
-    assert result[4]["robot_status"] == "degraded"
-    assert result[4]["daemon_error"] == "机器人硬件未就绪"
+    assert result[5]["robot_status"] == "degraded"
+    assert result[5]["daemon_error"] == "机器人硬件未就绪"
 
 
 @pytest.mark.asyncio
@@ -103,7 +144,7 @@ async def test_connect_mode_never_spawns(monkeypatch) -> None:
         Config(daemon_mode="connect", daemon_host="localhost")
     )
 
-    assert result[4]["daemon_error"] == "connect 模式下未发现健康 daemon"
+    assert result[5]["daemon_error"] == "connect 模式下未发现健康 daemon"
 
 
 @pytest.mark.asyncio
@@ -126,7 +167,7 @@ async def test_auto_degrades_when_an_external_process_owns_daemon_port(monkeypat
         Config(daemon_mode="auto", daemon_host="localhost")
     )
 
-    assert "端口已被外部或异常进程占用" in result[4]["daemon_error"]
+    assert "端口已被外部或异常进程占用" in result[5]["daemon_error"]
 
 
 @pytest.mark.asyncio

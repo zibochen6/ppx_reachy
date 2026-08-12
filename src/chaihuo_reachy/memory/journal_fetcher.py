@@ -10,6 +10,9 @@ manifest keyed by the stable Yuque slug.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+import contextlib
+import fcntl
 import hashlib
 import html as html_module
 from html.parser import HTMLParser
@@ -25,6 +28,36 @@ import httpx
 import yaml
 
 logger = logging.getLogger("chaihuo_reachy.journal_fetcher")
+
+
+@contextlib.contextmanager
+def journal_sync_lock(cache_dir: str | Path) -> Iterator[bool]:
+    """Non-blocking cross-process mutual exclusion for journal sync.
+
+    Locks ``<cache_dir>/.sync.lock`` with ``flock(LOCK_EX | LOCK_NB)`` and
+    yields ``True`` when the caller owns the lock and should run the sync,
+    ``False`` when another sync holds it (any process — flock treats
+    separately-opened fds as distinct even within one process, so the
+    dashboard's auto-sync and the engine's per-answer sync exclude each
+    other too).  Released on context exit or process death, so a crashed
+    sync can never wedge the periodic timer.
+    """
+    lock_path = Path(cache_dir) / ".sync.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+")  # never truncate; flock keys on the fd
+    try:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
 
 _YUQUE_URL_RE = re.compile(
     r"https://www\.yuque\.com/mouseart/mcv/(?P<slug>[a-z0-9]+)"

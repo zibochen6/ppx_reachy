@@ -6,7 +6,7 @@ the interface is a valid backend, no inheritance required.
 
 from __future__ import annotations
 
-from typing import AsyncIterator, Protocol, runtime_checkable
+from typing import AsyncIterator, Callable, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -14,6 +14,8 @@ import numpy as np
 # The Dashboard's 0-100 scale maps quadratically to PCM gain. This keeps
 # lower listening levels controllable while 100% reaches +12 dB over 50%.
 MAX_PLAYBACK_GAIN = 8.0
+
+PlaybackObserver = Callable[[bytes, int], None]
 
 
 def playback_gain_from_percent(percent: int | float) -> float:
@@ -111,11 +113,17 @@ class AudioBackend(Protocol):
         ...
 
     @volume.setter
-    def volume(self, val: float) -> None:
-        ...
+    def volume(self, val: float) -> None: ...
 
     def play_rms(self) -> float:
         """Smoothed RMS of the output signal."""
+        ...
+
+    def set_playback_observer(self, callback: PlaybackObserver | None) -> None:
+        """Observe post-gain mono PCM at the real speaker-consumption point.
+
+        The callback runs on an audio thread and must return immediately.
+        """
         ...
 
     # ── Sample rate ───────────────────────────────────────────────────
@@ -147,11 +155,9 @@ class AudioBackend(Protocol):
         """Whether audio-reactive head wobbling is supported."""
         ...
 
-    def enable_wobbling(self) -> None:
-        ...
+    def enable_wobbling(self) -> None: ...
 
-    def disable_wobbling(self) -> None:
-        ...
+    def disable_wobbling(self) -> None: ...
 
     @property
     def backend_name(self) -> str:

@@ -15,7 +15,7 @@ ROOT = Path(__file__).parents[1]
 
 def test_package_declares_sdk_dependency_and_app_entrypoint() -> None:
     metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert any(dep.startswith("reachy-mini>=1.8.0") for dep in metadata["project"]["dependencies"])
+    assert any(dep.startswith("reachy-mini>=1.9.0") for dep in metadata["project"]["dependencies"])
     assert metadata["project"]["entry-points"]["reachy_mini_apps"]["chaihuo_reachy"].endswith(
         ":ChaihuoReachyApp"
     )
@@ -92,7 +92,7 @@ async def test_daemon_spawn_timeout_polls_same_process_until_ready(monkeypatch) 
         media_backend="no_media",
         wobbling_enabled=False,
     )
-    reachy, audio, camera, motion, status = await main_module._try_connect_daemon(cfg)
+    reachy, audio, camera, motion, beat_dance, status = await main_module._try_connect_daemon(cfg)
 
     assert reachy is not None
     assert audio.backend_name == "fake-audio"
@@ -217,6 +217,7 @@ async def test_dashboard_initialization_error_still_cleans_owned_daemon(
             SimpleNamespace(),
             SimpleNamespace(),
             SimpleNamespace(),
+            None,  # beat_dance
             {"sdk_connected": True},
         )
 

@@ -12,7 +12,10 @@ uv sync
 # 设置环境变量
 cp .env.example .env  # 编辑填入你的百炼 API Key
 
-# 启动语音对话
+# 下载本地唤醒词模型（sherpa-onnx KWS，"皮皮虾"，一次性）
+uv run python scripts/download_kws_model.py
+
+# 启动语音对话（默认本地唤醒；说"皮皮虾"即时响应）
 uv run chaihuo-reachy
 
 # 启动 Web Dashboard
@@ -51,6 +54,20 @@ uv run python scripts/sync_journals.py --refresh-all --json
 ```
 
 基地车、人物、路线和旅途事件必须有本轮日记证据；没有可靠记录时固定回答不知道。普通常识仍可由模型回答，但不能冒充基地车事实。
+
+## 唤醒词
+
+默认在设备本地用 sherpa-onnx KWS 检测"皮皮虾"（约 0.5 秒响应，模型 33 MB，CPU 推理），
+检测到后才连接云端 ASR。相关配置（均可用环境变量覆盖）：
+
+- `REACHY_WAKE_ENGINE`：`local`（默认，本地 KWS）/ `cloud`（云端 ASR 转写文本匹配，旧路径）/ `off`
+- `REACHY_KWS_THRESHOLD`：触发阈值（默认 0.35；误唤醒多就调高到 0.45-0.55）
+- `REACHY_KWS_SCORE`：beam-search 增强分数（默认 1.0；漏唤醒多就调高）
+- `REACHY_WAKE_LISTEN_TIMEOUT_S`：等待唤醒词的最长时间（默认 60s）
+
+本地模型缺失或推理不可用时（如平台 wheel 损坏）自动回退云端文本匹配，服务不会挂掉；
+`uv run chaihuo-reachy test` 会自检 KWS 是否可用。macOS 上如遇
+`Library not loaded: libonnxruntime...` 报错，运行 `bash scripts/fix_mac_sherpa_dylib.sh`。
 
 ## 部署目标
 

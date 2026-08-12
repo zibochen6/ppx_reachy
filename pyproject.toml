@@ -10,6 +10,9 @@ dependencies = [
     "websockets>=15.0,<16",
     "httpx>=0.28.0",
     "sounddevice>=0.4.6",
+    # Reachy Mini XMOS card: PortAudio/mmap capture is silent, use ALSA rw
+    # (Linux only — needs ALSA headers; macOS dev uses sounddevice)
+    "pyalsaaudio>=0.10.0; sys_platform == 'linux'",
     "pyyaml>=6.0",
     "dashscope>=1.25.6",
     "python-dotenv>=1.0",
@@ -24,9 +27,11 @@ dependencies = [
     "uvicorn>=0.30",
     # Reachy daemon lifecycle; app media stays disabled because audio.py owns
     # the one required full-duplex XMOS stream.
-    "reachy-mini>=1.8.0,<2",
+    "reachy-mini>=1.9.0,<2",
     "sherpa-onnx>=1.13.4",
     "openwakeword>=0.6.0",
+    # Beat-dance: decode beat.mp3 → PCM for the ALSA playback pipeline
+    "miniaudio>=1.59",
 ]
 
 [project.optional-dependencies]

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 import httpx
 
@@ -55,7 +55,7 @@ class BailianLLMClient:
 
     async def chat_stream(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
     ) -> AsyncIterator[str]:
         """Stream LLM tokens. Yields one token string at a time."""
@@ -103,8 +103,9 @@ class BailianLLMClient:
 
     async def chat(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> dict:
         """Non-streaming chat completion. Returns full response dict."""
         body: dict = {
@@ -119,7 +120,7 @@ class BailianLLMClient:
             body["enable_search"] = True
         if tools:
             body["tools"] = tools
-            body["tool_choice"] = "auto"
+            body["tool_choice"] = tool_choice or "auto"
 
         assert self._client is not None
         response = await self._client.post("/chat/completions", json=body)

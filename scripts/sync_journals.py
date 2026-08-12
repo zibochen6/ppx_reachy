@@ -69,10 +69,19 @@ async def sync(args: argparse.Namespace) -> dict[str, object]:
     fetcher = JournalFetcher(listing_url=args.source, cache_dir=output)
     sync_error = ""
     try:
-        results = await fetcher.sync(
-            memory_store=store,
-            refresh_all=bool(args.refresh_all),
-        )
+        # Honor the cross-process flock: an explicit full sync that did not
+        # run must not report success (the periodic timer's sync does).
+        from chaihuo_reachy.memory.journal_fetcher import journal_sync_lock
+
+        with journal_sync_lock(output) as acquired:
+            if not acquired:
+                results = []
+                sync_error = "another sync in progress"
+            else:
+                results = await fetcher.sync(
+                    memory_store=store,
+                    refresh_all=bool(args.refresh_all),
+                )
     except Exception as exc:
         # The fetcher writes an honest partial manifest before raising.  Return
         # that state to the calling Agent instead of reducing it to plain text.

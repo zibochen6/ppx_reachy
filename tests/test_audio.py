@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from chaihuo_reachy.audio import AudioDeviceResolutionError, resolve_audio_device
@@ -78,3 +80,74 @@ def test_ambiguous_reachy_candidates_fail_with_indexes() -> None:
     ]
     with pytest.raises(AudioDeviceResolutionError, match="ambiguous indexes"):
         resolve_audio_device("auto", devices=truly_ambiguous)
+
+
+class _FakePCM:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _make_alsa_io() -> tuple:
+    from chaihuo_reachy.audio import DuplexAudioIO
+
+    audio = object.__new__(DuplexAudioIO)
+    audio._alsa = True
+    audio._alsa_stop = threading.Event()
+    audio._alsa_playback_stop = threading.Event()
+    audio._alsa_threads = []
+    audio._alsa_pcms = ()
+    audio._duplex_stream = None
+    audio._alsa_playback_pcm = _FakePCM()
+    return audio, audio._alsa_playback_pcm
+
+
+def test_alsa_full_close_releases_playback_pcm() -> None:
+    audio, pcm = _make_alsa_io()
+    audio._close_duplex(keep_playback=False)
+    assert pcm.closed  # else the XMOS device stays busy for the next launch
+
+
+def test_alsa_capture_teardown_keeps_playback_pcm() -> None:
+    audio, pcm = _make_alsa_io()
+    audio._close_duplex(keep_playback=True)  # end of a listen turn
+    assert not pcm.closed  # dance music / TTS outside a turn must keep playing
+    ambiguous = [DEVICES[0], {**DEVICES[0], "name": "Reachy Mini Audio: USB"}]
+    # Exact normalized name wins over a substring candidate.
+    assert resolve_audio_device("auto", devices=ambiguous).input_index == 0
+    truly_ambiguous = [
+        {**DEVICES[0], "name": "USB Reachy Mini Audio A"},
+        {**DEVICES[0], "name": "USB Reachy Mini Audio B"},
+    ]
+    with pytest.raises(AudioDeviceResolutionError, match="ambiguous indexes"):
+        resolve_audio_device("auto", devices=truly_ambiguous)
+
+
+def test_playback_observer_receives_consumed_pcm_and_can_be_unregistered() -> None:
+    from chaihuo_reachy.audio import DuplexAudioIO
+
+    audio = object.__new__(DuplexAudioIO)
+    audio.input_sr = 16_000
+    received: list[tuple[bytes, int]] = []
+    audio.set_playback_observer(lambda pcm, sr: received.append((pcm, sr)))
+    audio._notify_playback_observer(b"post-gain")
+    assert received == [(b"post-gain", 16_000)]
+
+    audio.set_playback_observer(None)
+    audio._notify_playback_observer(b"ignored")
+    assert received == [(b"post-gain", 16_000)]
+
+
+def test_playback_observer_failure_never_escapes_audio_thread() -> None:
+    from chaihuo_reachy.audio import DuplexAudioIO
+
+    audio = object.__new__(DuplexAudioIO)
+    audio.input_sr = 48_000
+
+    def broken(_pcm: bytes, _sr: int) -> None:
+        raise RuntimeError("motion overloaded")
+
+    audio.set_playback_observer(broken)
+    audio._notify_playback_observer(b"pcm")

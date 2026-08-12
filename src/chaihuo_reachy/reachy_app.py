@@ -54,9 +54,7 @@ class ChaihuoReachyApp(ReachyMiniApp):
             "mode": "reachy_daemon_app",
             "media_backend": "sdk_gstreamer",
             "robot_ready": True,
-            "daemon_host": os.environ.get(
-                "REACHY_DAEMON_HOST", "reachy-mini.local"
-            ),
+            "daemon_host": os.environ.get("REACHY_DAEMON_HOST", "reachy-mini.local"),
             "daemon_port": int(os.environ.get("REACHY_DAEMON_PORT", "8000")),
             "robot_class": type(reachy_mini).__name__,
         }
@@ -64,9 +62,7 @@ class ChaihuoReachyApp(ReachyMiniApp):
 
         # ── Step 3: Run the Dashboard + engine ────────────────────
         try:
-            asyncio.run(
-                _run_app(config, reachy_mini, status, stop_event)
-            )
+            asyncio.run(_run_app(config, reachy_mini, status, stop_event))
         except KeyboardInterrupt:
             logger.info("收到中断信号")
 
@@ -99,7 +95,7 @@ async def _run_app(
     # Create SDK backends
     audio_backend = create_audio_backend(config, reachy_mini.media_manager)
     camera_backend = create_camera_backend(config, reachy_mini.media_manager)
-    motion = MotionController(reachy_mini) if config.dance_enabled else None
+    motion = MotionController(reachy_mini, config) if config.dance_enabled else None
 
     logger.info(
         "Backends: audio=%s, camera=%s, motion=%s",
