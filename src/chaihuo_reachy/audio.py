@@ -227,13 +227,20 @@ def _want_alsa_backend(info: AudioDeviceInfo) -> bool:
     mmap mode, which is what PortAudio/sounddevice uses by default — arecord
     (rw mode) records fine.  Force pyalsaaudio rw-mode PCM for that card.
     Explicit opt-in via REACHY_AUDIO_BACKEND=alsa also works.
+
+    ALSA is Linux-only (pyalsaaudio); on macOS/Windows the Reachy Mini USB
+    card uses CoreAudio/PortAudio instead, so auto-detection by device name
+    must never select the ALSA backend there.
     """
     import os
+    import sys
 
     forced = os.environ.get("REACHY_AUDIO_BACKEND", "").strip().lower()
     if forced == "alsa":
         return True
     if forced == "sounddevice":
+        return False
+    if not sys.platform.startswith("linux"):
         return False
     name = f"{info.input_name} {info.output_name}".lower()
     return "reachy mini audio" in name
@@ -486,10 +493,19 @@ class DuplexAudioIO:
         Reachy Mini XMOS card: pyalsaaudio rw-mode PCM (mmap/PortAudio
         capture is silent on this card).  Otherwise sounddevice RawStream,
         trying 2-channel input first (echo-cancelled channel), then mono.
+
+        If the ALSA backend cannot be opened (not installed / not Linux),
+        clean up the partial state and fall back to sounddevice so the
+        conversation loop never dies on the backend choice.
         """
         if self._alsa:
-            self._open_alsa_duplex()
-            return
+            try:
+                self._open_alsa_duplex()
+                return
+            except Exception as exc:
+                logger.warning("ALSA 后端打开失败（%r），回退 sounddevice", exc)
+                self._close_duplex(keep_playback=False)
+                self._alsa = False
         last_err: Exception | None = None
         channel_options = [
             (in_ch, out_ch)

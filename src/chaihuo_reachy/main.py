@@ -1973,7 +1973,19 @@ async def _try_connect_daemon_impl(cfg: Config) -> tuple:
         and can_spawn_locally
         and await _daemon_port_is_occupied(cfg)
     ):
-        terminal_error = "本机 daemon 端口已被外部或异常进程占用，auto 模式不会接管"
+        # The port is held by a daemon we could not connect to.  If the
+        # ownership manifest still validates it (a leftover from a previous
+        # run whose shutdown was aborted, or one whose motor link died),
+        # reclaim it and fall through to a fresh spawn — otherwise the
+        # robot would stay dead forever behind an unhealthy zombie.
+        if _daemon_owner(cfg) == "owned":
+            logger.warning(
+                "检测到本项目遗留的 reachy-mini-daemon（PID 来自 %s），回收后重新拉起",
+                cfg.daemon_state_file,
+            )
+            await _recover_owned_daemon(cfg)
+        else:
+            terminal_error = "本机 daemon 端口已被外部或异常进程占用，auto 模式不会接管"
     if (
         reachy is None
         and not terminal_error
@@ -2170,6 +2182,13 @@ def _install_sigint_handler(cfg: Config) -> None:
     def _on_sigint(signum: int, frame: Any) -> None:
         if _GOT_FIRST_SIGINT.is_set():
             logger.error("🛑 再次 Ctrl+C，强制退出（释放音频设备与端口）")
+            # The graceful finally chain is being skipped, so reclaim the
+            # owned daemon here — otherwise it survives as an orphan that
+            # blocks the serial port and the next launch's daemon port.
+            try:
+                daemon_runtime.terminate_owned_state(cfg.daemon_state_file)
+            except Exception:
+                logger.exception("强制退出前回收 owned daemon 失败")
             os._exit(128 + signum)
         _GOT_FIRST_SIGINT.set()
         _arm_shutdown_backstop(owned_daemon_state_file=cfg.daemon_state_file)

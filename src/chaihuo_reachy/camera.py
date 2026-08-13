@@ -18,6 +18,7 @@ import logging
 import platform
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,24 @@ import cv2
 import numpy as np
 
 logger = logging.getLogger("chaihuo_reachy.camera")
+
+
+def _reap_subprocess(process: subprocess.Popen[bytes]) -> None:
+    """Wait for a terminated subprocess, escalating to SIGKILL if it lingers.
+
+    Runs on a daemon thread from ``close()`` so the event loop is never
+    blocked; guarantees the child is reaped (or killed) so a camera ffmpeg
+    can never survive as an orphan holding the device.
+    """
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg 未在 5 秒内退出，发送强制终止")
+        process.kill()
+        try:
+            process.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            logger.warning("ffmpeg 强制终止也超时（进程可能已失控）")
 
 
 def visual_quality_issue(jpeg: bytes) -> str | None:
@@ -408,7 +427,16 @@ class Camera:
                 process.terminate()
                 # Don't block the event loop — let the OS reap the process.
                 # The ffmpeg process reads from a pipe that will close, so it
-                # will exit on its own shortly after terminate().
+                # will exit on its own shortly after terminate().  The reaper
+                # thread guarantees wait() still runs, so a lingerer is
+                # SIGKILLed instead of surviving as an orphan holding the
+                # camera device.
+                threading.Thread(
+                    target=_reap_subprocess,
+                    args=(process,),
+                    name="ffmpeg-reaper",
+                    daemon=True,
+                ).start()
             self._ffmpeg_buffer.clear()
             self._prefetched_jpeg = None
             logger.info("Named AVFoundation camera closed")
