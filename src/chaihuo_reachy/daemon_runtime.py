@@ -138,5 +138,7 @@ def make_state(
         "simulation": simulation,
         "no_media": no_media,
         "command": command_text,
+        "headless": "--headless" in command,
+        "autostart": "--autostart" in command,
         "command_fingerprint": command_fingerprint(command_text),
     }

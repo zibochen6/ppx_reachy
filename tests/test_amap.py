@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -127,3 +128,53 @@ async def test_amap_error_is_safe_and_classified() -> None:
     assert "数字签名" in str(caught.value)
     assert "public-key" not in str(caught.value)
     assert "private-secret" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_iot_wifi_location_posts_fingerprint_and_returns_gcj02() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "status": "1",
+                "info": "OK",
+                "infocode": "10000",
+                "position": {
+                    "location": "116.326,40.001",
+                    "radius": "85",
+                    "formatted_address": "北京市海淀区",
+                    "addressComponent": {
+                        "province": "北京市",
+                        "city": "北京市",
+                        "district": "海淀区",
+                        "adcode": "110108",
+                    },
+                },
+            },
+        )
+
+    http = httpx.AsyncClient(
+        base_url="https://restapi.amap.com",
+        transport=httpx.MockTransport(handler),
+    )
+    client = AmapWebClient("public-key", client=http)
+    result = await client.locate_by_wifi(
+        [
+            {"bssid": "00:11:22:33:44:55", "signal_dbm": -50, "ssid": "hotspot", "connected": True},
+            {"bssid": "10:20:30:40:50:60", "signal_dbm": -60, "ssid": "ap1"},
+            {"bssid": "20:21:22:23:24:25", "signal_dbm": -70, "ssid": "ap2"},
+        ]
+    )
+
+    assert requests[0].method == "POST"
+    assert requests[0].url.path == "/v5/position/IoT"
+    form = parse_qs(requests[0].content.decode())
+    assert "00:11:22:33:44:55" in form["mmac"][0]
+    assert "00:11:22:33:44:55" not in form["macs"][0]
+    assert form["macs"][0].count("|") == 1
+    assert result["coordinate_system"] == "GCJ-02"
+    assert result["radius_m"] == 85.0
+    assert "00:11:22:33:44:55" not in str(result)

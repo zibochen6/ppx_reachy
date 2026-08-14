@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import platform
 import time
 
 import cv2
@@ -10,6 +11,7 @@ import pytest
 from chaihuo_reachy.config import Config
 from chaihuo_reachy.engine import ConversationEngine
 from chaihuo_reachy.main import _MJPEGStream
+from chaihuo_reachy.camera import _avfoundation_video_devices, find_reachy_camera
 
 
 class FakeCamera:
@@ -31,6 +33,42 @@ class FakeCamera:
 
     def close(self) -> None:
         self.closed = True
+
+
+def test_macos_camera_resolution_never_falls_back_to_an_index(monkeypatch) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        "chaihuo_reachy.camera._find_named_reachy_camera_macos", lambda: None
+    )
+    with pytest.raises(RuntimeError, match="拒绝回退到 Mac 前置摄像头"):
+        find_reachy_camera("auto")
+
+
+def test_macos_camera_resolution_uses_exact_reachy_name(monkeypatch) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        "chaihuo_reachy.camera._find_named_reachy_camera_macos",
+        lambda: "avfoundation:Reachy Mini Camera",
+    )
+    assert find_reachy_camera("auto") == "avfoundation:Reachy Mini Camera"
+
+
+def test_avfoundation_parser_maps_exact_video_names(monkeypatch) -> None:
+    stderr = """[AVFoundation indev @ 0x1] AVFoundation video devices:
+[AVFoundation indev @ 0x1] [0] Reachy Mini Camera
+[AVFoundation indev @ 0x1] [1] MacBook Pro的相机
+[AVFoundation indev @ 0x1] AVFoundation audio devices:
+[AVFoundation indev @ 0x1] [0] MacBook Pro麦克风
+"""
+    monkeypatch.setattr("chaihuo_reachy.camera.shutil.which", lambda _: "ffmpeg")
+    monkeypatch.setattr(
+        "chaihuo_reachy.camera.subprocess.run",
+        lambda *args, **kwargs: type("Result", (), {"stderr": stderr})(),
+    )
+    assert _avfoundation_video_devices() == {
+        "Reachy Mini Camera": 0,
+        "MacBook Pro的相机": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -59,7 +97,8 @@ async def test_engine_does_not_reopen_or_bypass_shared_camera_service() -> None:
 
     engine.set_camera_snapshot_provider(unavailable_service)
     result = await engine._tool_take_photo()
-    assert "没有拿到" in result
+    assert "暂时看不到前面" in result
+    assert "画面" not in result
     assert camera.capture_count == 0
 
 
@@ -81,4 +120,5 @@ async def test_vision_question_captures_and_rejects_a_black_frame() -> None:
 
     assert captures == 1
     assert result["intent"] == "front_camera"
-    assert "画面太暗" in result["reply"]
+    assert "光线太暗" in result["reply"]
+    assert all(word not in result["reply"] for word in ("拍照", "照片", "画面", "摄像头"))

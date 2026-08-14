@@ -77,6 +77,7 @@ ANTENNA_UP = [-1.5, 1.5]  # raised high
 ANTENNA_WAVE_LEFT_UP = [-2.0, 0.1745]  # left up, right neutral
 ANTENNA_WAVE_RIGHT_UP = [-0.1745, 2.0]  # right up, left neutral
 ANTENNA_CROSSED = [1.5, -1.5]  # crossed inward
+ANTENNA_BOTH_UP = [2.0, 2.0]  # both raised high (silly "hands up" pose)
 
 # ── Dance choreographies (data-driven) ──────────────────────────────────────
 #
@@ -146,7 +147,75 @@ DANCE_CHOREOGRAPHIES: dict[str, list[tuple[dict, int]]] = {
             1,
         ),
     ],
+    # 优雅: 长拍舒展, 抬头举臂, 左右缓倾
+    "elegant": [
+        ({"head": HEAD_LOOK_UP, "antennas": ANTENNA_UP, "body_yaw": 0.0}, 4),
+        ({"head": HEAD_TILT_LEFT, "antennas": ANTENNA_WAVE_LEFT_UP, "body_yaw": 0.15}, 2),
+        (
+            {
+                "head": HEAD_TILT_RIGHT,
+                "antennas": ANTENNA_WAVE_RIGHT_UP,
+                "body_yaw": -0.15,
+            },
+            2,
+        ),
+        ({"head": HEAD_LOOK_UP, "antennas": ANTENNA_UP, "body_yaw": 0.0}, 4),
+        ({"head": HEAD_LOOK_DOWN, "antennas": ANTENNA_CROSSED, "body_yaw": 0.0}, 2),
+        ({"head": HEAD_NEUTRAL, "antennas": ANTENNA_NEUTRAL, "body_yaw": 0.2}, 2),
+    ],
+    # 动感: 快节奏顿挫, 一拍一造型, 左右穿梭
+    "funky": [
+        ({"head": HEAD_TILT_LEFT, "antennas": ANTENNA_WAVE_LEFT_UP, "body_yaw": 0.25}, 1),
+        (
+            {
+                "head": HEAD_TILT_RIGHT,
+                "antennas": ANTENNA_WAVE_RIGHT_UP,
+                "body_yaw": -0.25,
+            },
+            1,
+        ),
+        ({"head": HEAD_LOOK_UP, "antennas": ANTENNA_UP, "body_yaw": 0.0}, 1),
+        ({"head": HEAD_LOOK_DOWN, "antennas": ANTENNA_CROSSED, "body_yaw": 0.0}, 1),
+        ({"head": HEAD_NEUTRAL, "antennas": ANTENNA_WAVE_LEFT_UP, "body_yaw": 0.3}, 1),
+        (
+            {
+                "head": HEAD_NEUTRAL,
+                "antennas": ANTENNA_WAVE_RIGHT_UP,
+                "body_yaw": -0.3,
+            },
+            1,
+        ),
+        ({"head": HEAD_TILT_LEFT, "antennas": ANTENNA_UP, "body_yaw": 0.0}, 2),
+    ],
+    # 搞怪: 交叉天线 + 双举, 大幅左右摆, 逗趣
+    "silly": [
+        ({"head": HEAD_TILT_LEFT, "antennas": ANTENNA_CROSSED, "body_yaw": -0.3}, 2),
+        ({"head": HEAD_TILT_RIGHT, "antennas": ANTENNA_BOTH_UP, "body_yaw": 0.3}, 2),
+        ({"head": HEAD_LOOK_UP, "antennas": ANTENNA_BOTH_UP, "body_yaw": 0.0}, 1),
+        ({"head": HEAD_LOOK_DOWN, "antennas": ANTENNA_CROSSED, "body_yaw": 0.0}, 2),
+        ({"head": HEAD_TILT_LEFT, "antennas": ANTENNA_WAVE_LEFT_UP, "body_yaw": 0.2}, 2),
+        (
+            {
+                "head": HEAD_TILT_RIGHT,
+                "antennas": ANTENNA_WAVE_RIGHT_UP,
+                "body_yaw": -0.2,
+            },
+            2,
+        ),
+    ],
 }
+
+
+def resolve_dance_style(style: str) -> str:
+    """Map a requested style (possibly "random") to a concrete style.
+
+    "random" picks uniformly from the available choreographies; every
+    other style passes through unchanged.  Unknown names are defaulted
+    to "happy" by ``dance()``, not here.
+    """
+    if style == "random":
+        return random.choice(list(DANCE_CHOREOGRAPHIES))
+    return style
 
 # Reachy Mini SDK daemon (<= 1.9.0) has a timing race in its interpolation
 # loop: on the last tick, ``t`` can exceed the requested duration (event-loop
@@ -299,7 +368,8 @@ class MotionController:
         """Perform a dance sequence, looping until the music ends.
 
         Args:
-            style: "happy", "swing", "robot", or "random"
+            style: one of ``DANCE_CHOREOGRAPHIES``, or "random" to pick
+                one at call time
             duration_s: total dance length; None = exactly one pass of the
                 choreography (used when no backing track exists)
             beat_s: length of one musical beat (from the track's BPM).
@@ -311,8 +381,7 @@ class MotionController:
             dropped by the SDK interpolation race (``_safe_goto``) are
             counted, never fatal; the sequence always completes.
         """
-        if style == "random":
-            style = random.choice(list(DANCE_CHOREOGRAPHIES))
+        style = resolve_dance_style(style)
         choreo = DANCE_CHOREOGRAPHIES.get(style, DANCE_CHOREOGRAPHIES["happy"])
 
         async with self._lock:
@@ -363,6 +432,31 @@ class MotionController:
         """Immediately set a target pose."""
         self._reachy.set_target(head=head, antennas=antennas, body_yaw=body_yaw)
 
+    def set_realtime_target(
+        self,
+        *,
+        head: np.ndarray | None = None,
+        antennas: list[float] | np.ndarray | None = None,
+        body_yaw: float = 0.0,
+    ) -> None:
+        """Send one non-interpolated target for an externally paced controller.
+
+        Gesture tracking and gesture dance own their pacing and cancellation;
+        routing them through ``goto_target`` would leave an interpolation alive
+        after a gesture changes.
+        """
+        self._reachy.set_target(head=head, antennas=antennas, body_yaw=body_yaw)
+
+    async def return_to_neutral(self, duration: float = 0.5) -> None:
+        """Smoothly return head, antennas and body yaw to the neutral pose."""
+        async with self._lock:
+            await self._safe_goto(
+                head=HEAD_NEUTRAL,
+                antennas=ANTENNA_NEUTRAL,
+                body_yaw=0.0,
+                duration=duration,
+            )
+
     async def goto_pose(
         self,
         head: np.ndarray | None = None,
@@ -390,6 +484,7 @@ class MotionController:
         """Wake the robot up — head up, antennas spread."""
         async with self._lock:
             logger.info("🤖 站起来")
+            self._reachy.enable_motors()
             self._reachy.wake_up()
 
     async def sleep(self) -> None:

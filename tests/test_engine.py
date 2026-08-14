@@ -7,32 +7,33 @@ import wave
 from pathlib import Path
 
 import pytest
+import time
 
 from chaihuo_reachy.config import Config
 from chaihuo_reachy.engine import (
     ConversationEngine,
+    _DANCE_REPLY_INJECTION,
     _JOURNAL_UNKNOWN,
     _WAKE_ONLY,
     _build_system_prompt,
     _enforce_journal_target_date,
     _extract_target_date,
 )
+from chaihuo_reachy.vision import VisualObservation
 
 
-def test_manual_location_is_injected_as_natural_location_context() -> None:
+def test_manual_location_is_not_injected_as_live_context() -> None:
     prompt = _build_system_prompt(Config(manual_location="上海市徐汇区西岸艺术中心"))
-    assert "【当前位置】" in prompt
-    assert "上海市徐汇区西岸艺术中心" in prompt
-    assert "【人工设置当前位置】" not in prompt
+    assert "上海市徐汇区西岸艺术中心" not in prompt
 
 
 @pytest.mark.asyncio
-async def test_manual_location_is_structured_final_fallback() -> None:
+async def test_manual_location_is_not_a_realtime_fallback() -> None:
     engine = ConversationEngine(Config(manual_location="北京市朝阳区三里屯"))
     result = await engine._tool_get_current_location()
-    assert result["place"] == "北京市朝阳区三里屯"
-    assert result["source"] == "configured_fallback"
-    assert result["precision"] == "city"
+    assert result["place"] == ""
+    assert result["source"] == "unavailable"
+    assert result["ok"] is False
 
 
 def test_cloud_engine_bare_wake_word_returns_sentinel_and_opens_followup_window() -> (
@@ -154,7 +155,11 @@ class _VoiceGateAudio:
 @pytest.mark.asyncio
 async def test_standby_waits_for_local_voice_before_opening_cloud_asr() -> None:
     engine = ConversationEngine(
-        Config(asr_initial_silence_timeout_s=0.2, voice_activity_threshold=0.06),
+        Config(
+            asr_initial_silence_timeout_s=0.2,
+            voice_activity_threshold=0.06,
+            vad_model_path="models/vad/not-installed.onnx",
+        ),
         audio_backend=_VoiceGateAudio([0.0, 0.08, 0.08]),  # type: ignore[arg-type]
     )
     received: list[list[bytes]] = []
@@ -381,11 +386,18 @@ def test_relative_journal_date_guard_corrects_neighboring_date() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_visual_request_asks_direction_without_camera() -> None:
+async def test_ambiguous_visual_request_defaults_to_front() -> None:
     engine = ConversationEngine(Config())
+    called: list[str] = []
+
+    async def observe(scope: str, **_kwargs) -> VisualObservation:
+        called.append(scope)
+        return VisualObservation.failure(scope=scope, error="我现在暂时看不到前面。")
+
+    engine._observe_scene = observe  # type: ignore[method-assign]
     result = await engine.process_text("帮我看看")
     assert "前" in result["reply"]
-    assert "车外" in result["reply"]
+    assert called == ["front"]
     assert result["intent"] == "ambiguous_camera"
 
 
@@ -394,16 +406,17 @@ async def test_front_and_rear_routes_use_different_handlers() -> None:
     engine = ConversationEngine(Config())
     called: list[str] = []
 
-    async def front(_image=None) -> str:
-        called.append("front")
-        return "前置画面"
+    async def observe(scope: str, **_kwargs) -> VisualObservation:
+        called.append(scope)
+        return VisualObservation.success(scope=scope, facts=f"{scope}有一个杯子")
 
-    async def rear() -> str:
-        called.append("rear")
-        return "后视画面"
+    async def synthesize(_messages) -> tuple[str, str]:
+        assert engine._current_visual_observation is not None
+        scope = engine._current_visual_observation.scope
+        return ("我看到前面有一个杯子。" if scope == "front" else "我看到车外有一辆车。", "")
 
-    engine._tool_take_photo = front  # type: ignore[method-assign]
-    engine._tool_capture_rear_view = rear  # type: ignore[method-assign]
+    engine._observe_scene = observe  # type: ignore[method-assign]
+    engine._think_text_only = synthesize  # type: ignore[method-assign]
     front_result = await engine.process_text("你能看到什么？")
     rear_result = await engine.process_text("外面有什么？")
     assert called == ["front", "rear"]
@@ -424,8 +437,95 @@ async def test_general_reply_cannot_claim_camera_view_without_capture() -> None:
     engine._think_text_only = hallucinated_reply  # type: ignore[method-assign]
     result = await engine.process_text("随便聊两句")
 
-    assert "这轮没有拍照" in result["reply"]
+    assert "没有真正看清楚" in result["reply"]
     assert "冰美式" not in result["reply"]
+
+
+@pytest.mark.asyncio
+async def test_semantic_visual_turn_exposes_tool_and_uses_grounded_result() -> None:
+    engine = ConversationEngine(Config(vision_policy="semantic"))
+    observed: list[tuple[str, str]] = []
+
+    async def observe(scope: str, *, focus: str, **_kwargs) -> VisualObservation:
+        observed.append((scope, focus))
+        return VisualObservation.success(scope=scope, facts="手里拿着一个黄色万用表")
+
+    async def tool_aware_reply(_messages) -> tuple[str, str]:
+        assert engine._active_response_tools[0]["name"] == "observe_scene"
+        assert engine._active_response_tool_handler is not None
+        result = await engine._active_response_tool_handler(
+            "observe_scene", {"scope": "front", "focus": "确认手里的物体"}
+        )
+        assert result["ok"] is True
+        return "这是一个黄色万用表。", ""
+
+    engine._observe_scene = observe  # type: ignore[method-assign]
+    engine._think_text_only = tool_aware_reply  # type: ignore[method-assign]
+    result = await engine.process_text("我手里拿的是什么？")
+
+    assert observed == [("front", "确认手里的物体")]
+    assert result["reply"] == "这是一个黄色万用表。"
+    assert result["sources"][0]["type"] == "live_vision"
+    assert engine.runtime_status()["vision"]["called"] is True
+
+
+@pytest.mark.asyncio
+async def test_nonvisual_turn_does_not_expose_camera_tool() -> None:
+    engine = ConversationEngine(Config(vision_policy="semantic"))
+
+    async def reply(_messages) -> tuple[str, str]:
+        assert engine._active_response_tools == []
+        return "我觉得关键在于先明确目标。", ""
+
+    engine._think_text_only = reply  # type: ignore[method-assign]
+    result = await engine.process_text("你怎么看这个问题？")
+    assert result["reply"].startswith("我觉得")
+    assert engine.runtime_status()["vision"]["called"] is False
+
+
+@pytest.mark.asyncio
+async def test_mechanism_heavy_visual_reply_is_replaced() -> None:
+    engine = ConversationEngine(Config())
+
+    async def observe(scope: str, **_kwargs) -> VisualObservation:
+        return VisualObservation.success(scope=scope, facts="桌上放着一个红色杯子")
+
+    async def bad_reply(_messages) -> tuple[str, str]:
+        return "根据照片分析，画面中显示一个红色杯子。", ""
+
+    engine._observe_scene = observe  # type: ignore[method-assign]
+    engine._think_text_only = bad_reply  # type: ignore[method-assign]
+    result = await engine.process_text("你看到了什么？")
+    assert result["reply"] == "我看到桌上放着一个红色杯子。"
+    assert all(
+        word not in result["reply"]
+        for word in ("拍照", "照片", "图片", "画面", "摄像头", "根据图片")
+    )
+
+
+@pytest.mark.asyncio
+async def test_referential_followup_reuses_short_lived_visual_observation() -> None:
+    engine = ConversationEngine(Config(visual_context_ttl_s=15))
+    observation = VisualObservation.success(scope="front", facts="一个蓝色杯子")
+    from chaihuo_reachy.vision import VisualCache
+
+    engine._visual_cache = VisualCache(
+        observation=observation,
+        jpeg=b"private-jpeg",
+        stored_monotonic=time.monotonic(),
+        focus="它是什么颜色",
+    )
+
+    async def forbidden_capture(*_args, **_kwargs):
+        raise AssertionError("fresh visual follow-up must not recapture")
+
+    engine._capture_visual_jpeg = forbidden_capture  # type: ignore[method-assign]
+    assert engine._should_reuse_visual("它是什么颜色？", "front")
+    reused = await engine._observe_scene(
+        "front", focus="它是什么颜色", prefer_cache=True
+    )
+    assert reused.observation_id == observation.observation_id
+    assert not engine._should_reuse_visual("它现在还在吗？", "front")
 
 
 # ── Dance backing music ───────────────────────────────────────────────────
@@ -586,8 +686,107 @@ async def test_tool_dance_plays_music_while_dancing(tmp_path) -> None:
         motion=_FakeMotion(),  # type: ignore[arg-type]
     )
     reply = await engine._tool_dance("happy")
-    assert "舞蹈" in reply
+    # Success hands the turn to the LLM for an improvised remark, so the
+    # tool itself returns "" and records the finished dance.
+    assert reply == ""
+    assert engine._pending_dance is not None
+    assert engine._pending_dance["style"] == "happy"
+    assert engine._pending_dance["turn_id"] == engine._current_turn_id
     assert audio.plays  # music was fed while dancing
+
+
+@pytest.mark.asyncio
+async def test_tool_dance_random_resolves_concrete_style(tmp_path) -> None:
+    _make_wav(tmp_path / "swing.wav", sr=16000, seconds=0.4)
+
+    seen: dict[str, str] = {}
+
+    class _FakeMotion:
+        async def dance(self, style: str, **kwargs) -> dict:
+            seen["style"] = style
+            return {"style": style, "skipped": 0, "duration": 0.1}
+
+    audio = _MusicFakeAudio()
+    engine = ConversationEngine(
+        Config(dance_music_dir=str(tmp_path)),
+        audio_backend=audio,  # type: ignore[arg-type]
+        motion=_FakeMotion(),  # type: ignore[arg-type]
+    )
+    await engine._tool_dance("random")
+    # random resolves to one concrete choreography, never the literal
+    # "random" (which has no matching track anymore).
+    assert seen["style"] in {"happy", "swing", "robot", "elegant", "funky", "silly"}
+    assert engine._pending_dance is not None
+    assert engine._pending_dance["style"] == seen["style"]
+
+
+@pytest.mark.asyncio
+async def test_tool_dance_failure_paths(tmp_path) -> None:
+    engine = ConversationEngine(Config(dance_music_dir=str(tmp_path)))
+    assert engine._motion is None
+    reply = await engine._tool_dance("random")
+    assert reply == "运动控制未启用，无法跳舞。"
+    assert engine._pending_dance is None
+
+
+@pytest.mark.asyncio
+async def test_motion_style_keyword_mapping() -> None:
+    engine = ConversationEngine(Config())
+    seen: list[str] = []
+
+    async def fake_dance(style: str, **kwargs) -> str:
+        seen.append(style)
+        return ""
+
+    engine._tool_dance = fake_dance  # type: ignore[method-assign]
+    cases = {
+        "跳个舞": "random",
+        "随便跳个舞": "random",
+        "跳个优雅的舞": "elegant",
+        "来段机械舞": "robot",
+        "跳个动感的舞": "funky",
+        "跳个搞笑的舞": "silly",
+        "跳个欢快的舞": "happy",
+        "跳个慢一点的舞": "swing",
+    }
+    for text, expected in cases.items():
+        seen.clear()
+        await engine._execute_deterministic_motion(text)
+        assert seen == [expected], f"{text!r} → {seen}, want {expected!r}"
+
+
+@pytest.mark.asyncio
+async def test_dance_turn_injects_llm_context(tmp_path) -> None:
+    class _FakeMotion:
+        async def dance(self, style: str, **kwargs) -> dict:
+            return {"style": style, "skipped": 0, "duration": 0.1}
+
+    captured: list[list[dict[str, str]]] = []
+
+    async def fake_think(messages: list[dict[str, str]]) -> tuple[str, str]:
+        captured.append(messages)
+        return "刚才随音乐随便扭了一段，真开心！", ""
+
+    engine = ConversationEngine(
+        Config(dance_music_dir=str(tmp_path)),
+        motion=_FakeMotion(),  # type: ignore[arg-type]
+    )
+    engine._think_text_only = fake_think  # type: ignore[method-assign]
+    result = await engine.process_text("跳个舞")
+
+    assert result["intent"] == "motion"
+    assert result["reply"] == "刚才随音乐随便扭了一段，真开心！"
+    assert captured, "LLM branch must run after a successful dance"
+    system = captured[0][0]["content"]
+    assert "舞蹈提示" in system
+    # The style is never revealed to the model — the robot improvises.
+    for style in ("swing", "robot", "elegant", "funky", "silly"):
+        assert style not in system
+    # "happy" collides with the persona's [happy] emotion tag, so verify the
+    # injection text itself never names any style instead.
+    assert "happy" not in _DANCE_REPLY_INJECTION
+    assert engine._pending_dance is None  # consumed by this turn
+    assert len(engine._conversation_history) == 2  # user + improvised reply
 
 
 # ── Beat-dance loop (infinite dance, voice suspended) ─────────────────

@@ -113,6 +113,13 @@ def test_browser_uses_page_host_and_normalized_chat_protocol() -> None:
     assert 'http://localhost:8640/' in DASHBOARD_HTML
     assert "dbCam" not in DASHBOARD_HTML
     assert 'm.type==="asr_status"' in DASHBOARD_HTML
+    assert 'id="modelInfo"' in DASHBOARD_HTML
+    assert 'id="searchInfo"' in DASHBOARD_HTML
+    assert 'id="audioFrontend"' in DASHBOARD_HTML
+    assert 'id="locationInfo"' in DASHBOARD_HTML
+    assert "已联网核验" in DASHBOARD_HTML
+    assert "navigator.geolocation.watchPosition" in DASHBOARD_HTML
+    assert 'type:"browser_location"' in DASHBOARD_HTML
 
 
 def test_chat_store_replays_both_sides_sources_and_capture() -> None:

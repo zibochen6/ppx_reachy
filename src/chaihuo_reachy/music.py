@@ -20,6 +20,19 @@ _MIN_BPM = 70.0
 _MAX_BPM = 180.0
 _ENVELOPE_FRAME_S = 0.02
 
+# BPM of the tracks synthesized by scripts/gen_dance_music.py.  The
+# autocorrelation detector misreads these synthetic patterns (offbeat
+# hats win over the kick), so known styles use the table and unknown
+# tracks fall back to ``detect_bpm``.
+STYLE_BPM: dict[str, float] = {
+    "happy": 120.0,
+    "swing": 100.0,
+    "robot": 90.0,
+    "elegant": 80.0,
+    "funky": 132.0,
+    "silly": 112.0,
+}
+
 
 def resolve_track(music_dir: Path | str, style: str) -> Path | None:
     """Pick the backing track for a dance style.

@@ -46,14 +46,20 @@ class Config:
     bailian_vlm_model: str = "qwen-vl-plus"
 
     # ── Web search ────────────────────────────────────────────────────
-    enable_search: bool = False  # Enable Bailian built-in web search
+    # ``enable_search`` remains as a compatibility view for older Dashboard
+    # clients. New code uses the three-state policy below.
+    enable_search: bool = True
+    search_policy: str = "auto"  # "auto" | "explicit" | "off"
+    search_timeout_s: float = 20.0
+    search_circuit_breaker_s: float = 30.0
 
     # ── ASR settings ───────────────────────────────────────────────────
     asr_language: str = "zh"
-    asr_vad_silence_ms: int = 1100  # Normal server-side endpoint window
-    asr_vad_threshold: float = 0.35  # VAD sensitivity — lower = more sensitive
+    asr_vad_silence_ms: int = 600  # Server-side second-layer endpoint window
+    asr_vad_threshold: float = 0.50  # Lower values admit more background speech
     asr_initial_silence_timeout_s: float = 20.0  # Wait for first speech onset
-    asr_speech_max_duration_s: float = 45.0  # Maximum duration after onset
+    asr_speech_max_duration_s: float = 15.0  # Compatibility hard ceiling
+    asr_finalize_timeout_s: float = 2.0
     asr_min_chars: int = 2
 
     # ── LLM settings ───────────────────────────────────────────────────
@@ -103,6 +109,16 @@ class Config:
     audio_sample_rate: int = 16000
     audio_input_channel: int = 1  # Reachy ch1 = AEC-processed (echo-cancelled)
     audio_mic_gain: float = 1.0  # Unity gain; avoid clipping that degrades ASR
+    audio_frontend_v2: bool = True
+    vad_model_path: str = "models/vad/silero_vad.onnx"
+    vad_on_threshold: float = 0.60
+    vad_off_threshold: float = 0.35
+    endpoint_silence_ms: int = 700
+    max_utterance_s: float = 15.0
+    min_utterance_ms: int = 200
+    doa_tolerance_deg: float = 35.0
+    doa_mismatch_ms: int = 800
+    followup_window_s: float = 8.0
 
     # ── SDK Media backend ───────────────────────────────────────────────
     # "auto" → SDK daemon 模式下用 local，standalone 用 no_media
@@ -130,7 +146,7 @@ class Config:
     talk_motion_pitch_max_deg: float = 3.2
     talk_motion_roll_max_deg: float = 2.0
     talk_motion_gain: float = 1.0
-    doa_enabled: bool = False  # 麦克风阵列声源定位
+    doa_enabled: bool = True  # 麦克风阵列声源定位 / audio direction gate
     # 跳舞伴奏音乐目录: 放 <style>.wav (happy/swing/robot) 或任意 *.wav;
     # 缺失时安静跳舞（不报错）。
     dance_music_dir: str = "music"
@@ -146,6 +162,23 @@ class Config:
     camera_width: int = 640
     camera_height: int = 480
 
+    # ── Single-hand pose interaction ──────────────────────────────────
+    gesture_backend: str = "auto"  # auto | coreml | mps | tensorrt
+    gesture_coreml_model_path: str = "models/hand_pose/hand_pose_resnet18.mlpackage"
+    gesture_torchscript_model_path: str = "models/hand_pose/hand_pose_resnet18.ts"
+    gesture_tensorrt_engine_path: str = "models/hand_pose/hand_pose_resnet18_fp16.engine"
+    gesture_torch2trt_model_path: str = "models/hand_pose/hand_pose_resnet18_torch2trt.pth"
+    gesture_inference_fps: float = 15.0
+    gesture_keypoint_confidence: float = 0.15
+    gesture_confirmation_ms: int = 300
+    gesture_lost_timeout_ms: int = 800
+    gesture_tracking_deadzone: float = 0.06
+    gesture_tracking_alpha: float = 0.35
+    gesture_tracking_max_step_deg: float = 2.0
+    gesture_head_yaw_max_deg: float = 20.0
+    gesture_head_pitch_max_deg: float = 20.0
+    gesture_body_yaw_max_deg: float = 30.0
+
     # ── Location / GPS ──────────────────────────────────────────────────
     location_gpsd_enabled: bool = True  # Try GPSD daemon for real GPS
     location_gpsd_host: str = "127.0.0.1"
@@ -156,7 +189,10 @@ class Config:
     # Operator-declared current location. This is text so a known venue or
     # city can be supplied even when no live source is available. It is now a
     # final fallback rather than an absolute override.
-    manual_location: str = ""
+    manual_location: str = ""  # Deprecated: session note only, never live location
+    location_wifi_enabled: bool = True
+    location_wifi_scan_interval_s: float = 10.0
+    location_wifi_fresh_s: float = 30.0
     amap_web_key: str = ""
     amap_web_private_key: str = ""
     amap_timeout_s: float = 3.0
@@ -194,6 +230,13 @@ class Config:
     chat_history_limit: int = 100
     capture_history_limit: int = 20
     camera_frame_max_age_s: float = 3.0
+
+    # ── Semantic vision ────────────────────────────────────────────────
+    # semantic: implicit + explicit vision; semantic_shadow: log implicit
+    # decisions without capturing; explicit: keyword routes only; off: disabled.
+    vision_policy: str = "semantic"
+    visual_context_ttl_s: float = 15.0
+    vision_max_calls_per_turn: int = 1
 
     # ── Persona ────────────────────────────────────────────────────────
     persona: str = "xiao_chai"
@@ -240,6 +283,9 @@ _ENV: dict[str, str] = {
     "bailian_tts_voice": "BAILIAN_TTS_VOICE",
     "bailian_vlm_model": "BAILIAN_VLM_MODEL",
     "enable_search": "BAILIAN_ENABLE_SEARCH",
+    "search_policy": "REACHY_SEARCH_POLICY",
+    "search_timeout_s": "REACHY_SEARCH_TIMEOUT_S",
+    "search_circuit_breaker_s": "REACHY_SEARCH_CIRCUIT_BREAKER_S",
     "target": "REACHY_TARGET",
     "asr_language": "BAILIAN_ASR_LANGUAGE",
     "asr_vad_silence_ms": "BAILIAN_ASR_VAD_SILENCE_MS",
@@ -247,6 +293,7 @@ _ENV: dict[str, str] = {
     "asr_initial_silence_timeout_s": "BAILIAN_ASR_INITIAL_SILENCE_TIMEOUT_S",
     "asr_speech_max_duration_s": "BAILIAN_ASR_SPEECH_MAX_DURATION_S",
     "asr_min_chars": "BAILIAN_ASR_MIN_CHARS",
+    "asr_finalize_timeout_s": "BAILIAN_ASR_FINALIZE_TIMEOUT_S",
     "llm_temperature": "BAILIAN_LLM_TEMPERATURE",
     "llm_max_tokens": "BAILIAN_LLM_MAX_TOKENS",
     "llm_system_prompt": "BAILIAN_LLM_SYSTEM_PROMPT",
@@ -268,6 +315,16 @@ _ENV: dict[str, str] = {
     "audio_device": "REACHY_AUDIO_DEVICE",
     "audio_input_channel": "REACHY_AUDIO_INPUT_CHANNEL",
     "audio_mic_gain": "REACHY_MIC_GAIN",
+    "audio_frontend_v2": "REACHY_AUDIO_FRONTEND_V2",
+    "vad_model_path": "REACHY_VAD_MODEL_PATH",
+    "vad_on_threshold": "REACHY_VAD_ON_THRESHOLD",
+    "vad_off_threshold": "REACHY_VAD_OFF_THRESHOLD",
+    "endpoint_silence_ms": "REACHY_ENDPOINT_SILENCE_MS",
+    "max_utterance_s": "REACHY_MAX_UTTERANCE_S",
+    "min_utterance_ms": "REACHY_MIN_UTTERANCE_MS",
+    "doa_tolerance_deg": "REACHY_DOA_TOLERANCE_DEG",
+    "doa_mismatch_ms": "REACHY_DOA_MISMATCH_MS",
+    "followup_window_s": "REACHY_FOLLOWUP_WINDOW_S",
     "camera_device": "REACHY_CAMERA_DEVICE",
     "dashboard_port": "REACHY_DASHBOARD_PORT",
     "language": "REACHY_LANGUAGE",
@@ -275,6 +332,9 @@ _ENV: dict[str, str] = {
     "manual_location": "REACHY_MANUAL_LOCATION",
     "location_gps_fresh_s": "REACHY_LOCATION_GPS_FRESH_S",
     "location_browser_fresh_s": "REACHY_LOCATION_BROWSER_FRESH_S",
+    "location_wifi_enabled": "REACHY_LOCATION_WIFI_ENABLED",
+    "location_wifi_scan_interval_s": "REACHY_LOCATION_WIFI_SCAN_INTERVAL_S",
+    "location_wifi_fresh_s": "REACHY_LOCATION_WIFI_FRESH_S",
     "amap_web_key": "AMAP_WEB_KEY",
     "amap_web_private_key": "AMAP_WEB_PRIVATE_KEY",
     "amap_timeout_s": "AMAP_TIMEOUT_S",
@@ -301,6 +361,21 @@ _ENV: dict[str, str] = {
     "beat_dance_enabled": "REACHY_BEAT_DANCE_ENABLED",
     "beat_music_path": "REACHY_BEAT_MUSIC_PATH",
     "beat_timeline_path": "REACHY_BEAT_TIMELINE_PATH",
+    "gesture_backend": "REACHY_GESTURE_BACKEND",
+    "gesture_coreml_model_path": "REACHY_GESTURE_COREML_MODEL",
+    "gesture_torchscript_model_path": "REACHY_GESTURE_TORCHSCRIPT_MODEL",
+    "gesture_tensorrt_engine_path": "REACHY_GESTURE_TENSORRT_ENGINE",
+    "gesture_torch2trt_model_path": "REACHY_GESTURE_TORCH2TRT_MODEL",
+    "gesture_inference_fps": "REACHY_GESTURE_INFERENCE_FPS",
+    "gesture_keypoint_confidence": "REACHY_GESTURE_KEYPOINT_CONFIDENCE",
+    "gesture_confirmation_ms": "REACHY_GESTURE_CONFIRMATION_MS",
+    "gesture_lost_timeout_ms": "REACHY_GESTURE_LOST_TIMEOUT_MS",
+    "gesture_tracking_deadzone": "REACHY_GESTURE_TRACKING_DEADZONE",
+    "gesture_tracking_alpha": "REACHY_GESTURE_TRACKING_ALPHA",
+    "gesture_tracking_max_step_deg": "REACHY_GESTURE_TRACKING_MAX_STEP_DEG",
+    "gesture_head_yaw_max_deg": "REACHY_GESTURE_HEAD_YAW_MAX_DEG",
+    "gesture_head_pitch_max_deg": "REACHY_GESTURE_HEAD_PITCH_MAX_DEG",
+    "gesture_body_yaw_max_deg": "REACHY_GESTURE_BODY_YAW_MAX_DEG",
     "ezviz_app_key": "EZVIZ_APP_KEY",
     "ezviz_app_secret": "EZVIZ_APP_SECRET",
     "ezviz_device_serial": "EZVIZ_DEVICE_SERIAL",
@@ -309,6 +384,9 @@ _ENV: dict[str, str] = {
     "journal_index_v3_enabled": "JOURNAL_INDEX_V3",
     "source_router_v2_enabled": "SOURCE_ROUTER_V2",
     "session_state_v2_enabled": "SESSION_STATE_V2",
+    "vision_policy": "REACHY_VISION_POLICY",
+    "visual_context_ttl_s": "REACHY_VISUAL_CONTEXT_TTL_S",
+    "vision_max_calls_per_turn": "REACHY_VISION_MAX_CALLS_PER_TURN",
 }
 
 
@@ -358,5 +436,45 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
             "修正旧 TTS 模型拼写 qwen3-tts-flash-realtim -> qwen3-tts-flash-realtime"
         )
         cfg.bailian_tts_model = "qwen3-tts-flash-realtime"
+
+    cfg.search_policy = str(cfg.search_policy or "auto").strip().lower()
+    if cfg.search_policy not in {"auto", "explicit", "off"}:
+        logger.warning("未知搜索策略 %r，回退为 auto", cfg.search_policy)
+        cfg.search_policy = "auto"
+    # The legacy flag may only turn search off; it can no longer silently
+    # downgrade auto planning into an unobservable in-memory toggle.
+    legacy_search = os.environ.get("BAILIAN_ENABLE_SEARCH")
+    if legacy_search is not None and not _coerce(legacy_search, bool):
+        cfg.search_policy = "off"
+    cfg.enable_search = cfg.search_policy != "off"
+
+    cfg.vision_policy = str(cfg.vision_policy or "semantic").strip().lower()
+    if cfg.vision_policy not in {"semantic", "semantic_shadow", "explicit", "off"}:
+        logger.warning("未知视觉策略 %r，回退为 semantic", cfg.vision_policy)
+        cfg.vision_policy = "semantic"
+    cfg.visual_context_ttl_s = max(0.0, float(cfg.visual_context_ttl_s))
+    cfg.vision_max_calls_per_turn = max(1, int(cfg.vision_max_calls_per_turn))
+
+    cfg.gesture_backend = str(cfg.gesture_backend or "auto").strip().lower()
+    if cfg.gesture_backend not in {"auto", "coreml", "mps", "tensorrt"}:
+        logger.warning("未知手势推理后端 %r，回退为 auto", cfg.gesture_backend)
+        cfg.gesture_backend = "auto"
+    cfg.gesture_inference_fps = max(1.0, float(cfg.gesture_inference_fps))
+    cfg.gesture_confirmation_ms = max(50, int(cfg.gesture_confirmation_ms))
+    cfg.gesture_lost_timeout_ms = max(100, int(cfg.gesture_lost_timeout_ms))
+    cfg.gesture_tracking_deadzone = max(0.0, min(0.25, float(cfg.gesture_tracking_deadzone)))
+    cfg.gesture_tracking_alpha = max(0.01, min(1.0, float(cfg.gesture_tracking_alpha)))
+    cfg.gesture_tracking_max_step_deg = max(
+        0.1, min(10.0, float(cfg.gesture_tracking_max_step_deg))
+    )
+    cfg.gesture_head_yaw_max_deg = max(
+        1.0, min(45.0, float(cfg.gesture_head_yaw_max_deg))
+    )
+    cfg.gesture_head_pitch_max_deg = max(
+        1.0, min(35.0, float(cfg.gesture_head_pitch_max_deg))
+    )
+    cfg.gesture_body_yaw_max_deg = max(
+        1.0, min(60.0, float(cfg.gesture_body_yaw_max_deg))
+    )
 
     return cfg

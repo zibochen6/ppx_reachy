@@ -83,6 +83,12 @@ write("swing", build_track(100, [(1, 0, 2, 0, 1, 0, 2, 0),
                                   (1, 0, 2, 0, 1, 0, 2, 2)], [196, 196, 220, 196]))
 # robot: 90 BPM, stiff on-beat kick + snare, no swing
 write("robot", build_track(90, [(1, 0, 0, 0, 2, 0, 0, 0)], [110, 110, 110, 147]))
-# random: 115 BPM mash
-write("random", build_track(115, [(1, 2, 0, 0, 1, 2, 0, 0),
-                                   (1, 2, 1, 0, 1, 2, 1, 2)], [165, 165, 196, 165]))
+# elegant: 80 BPM, sparse kick with a gentle snare, unhurried
+write("elegant", build_track(80, [(1, 0, 0, 0, 0, 0, 0, 0),
+                                  (1, 0, 0, 0, 2, 0, 0, 0)], [110, 130, 110, 98]))
+# funky: 132 BPM, syncopated drums + jumping bass
+write("funky", build_track(132, [(1, 2, 1, 0, 0, 2, 1, 2),
+                                 (1, 0, 2, 0, 1, 2, 1, 0)], [82, 82, 98, 82]))
+# silly: 112 BPM, offbeat staccato, playful
+write("silly", build_track(112, [(1, 0, 1, 2, 0, 1, 0, 2),
+                                 (1, 2, 0, 0, 1, 0, 2, 1)], [147, 131, 165, 131]))

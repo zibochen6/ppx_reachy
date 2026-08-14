@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 
 
-class TurnIntent(StrEnum):
+class TurnIntent(str, Enum):
     GENERAL = "general"
     JOURNAL = "journal"
     JOURNEY_RECALL = "journey_recall"

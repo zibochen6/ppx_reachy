@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,16 +28,19 @@ async def test_asr_configures_vad_once_before_audio_ingestion() -> None:
     await client.configure()
     assert len(websocket.messages) == 1
     assert websocket.messages[0]["type"] == "session.update"
-    assert websocket.messages[0]["session"]["turn_detection"]["silence_duration_ms"] == 1100
+    turn_detection = websocket.messages[0]["session"]["turn_detection"]
+    assert turn_detection["silence_duration_ms"] == 600
+    assert turn_detection["threshold"] == 0.5
 
 
 def test_runtime_status_exposes_asr_endpoint_policy() -> None:
     engine = ConversationEngine(Config())
     assert engine.runtime_status()["asr"] == {
-        "vad_silence_ms": 1100,
+        "vad_silence_ms": 600,
         "initial_silence_timeout_s": 20.0,
-        "speech_max_duration_s": 45.0,
+        "speech_max_duration_s": 15.0,
         "last_end_reason": "",
+        "frontend_v2": True,
     }
 
 
@@ -137,3 +141,41 @@ async def test_speech_can_exceed_initial_window_but_stops_at_speech_maximum(monk
     ], initial=0.01, maximum=0.01)
     assert await timed_out._listen_cloud_asr(capture=_fake_capture()) == ""
     assert timed_out._last_asr_end_reason == "speech_max_duration_timeout"
+
+
+@pytest.mark.asyncio
+async def test_local_endpoint_commits_repeated_stable_partial(monkeypatch) -> None:
+    import chaihuo_reachy.engine as engine_module
+
+    class Endpoint:
+        vad = SimpleNamespace(available=True)
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def update(self, _chunk):
+            return SimpleNamespace(
+                rms=0.1,
+                dbfs=-20.0,
+                snr_db=15.0,
+                vad_probability=0.9,
+                speech=True,
+                endpoint=True,
+                endpoint_reason="local_silence",
+            )
+
+    monkeypatch.setattr(engine_module, "SpeechEndpoint", Endpoint)
+    engine, asr = _engine_with_fake_asr(
+        monkeypatch,
+        [
+            (0.0, ASRResult(text="", speech_started=True)),
+            (0.0, ASRResult(text="请介绍基地车")),
+            (0.0, ASRResult(text="请介绍基地车")),
+        ],
+        maximum=1.0,
+    )
+    engine.config.asr_finalize_timeout_s = 0.01
+
+    assert await engine._listen_cloud_asr(capture=_fake_capture()) == "请介绍基地车"
+    assert asr.finished
+    assert engine._last_asr_end_reason == "finalize_timeout"

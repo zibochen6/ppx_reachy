@@ -80,6 +80,38 @@ _REACHY_AVFOUNDATION_NAME = "Reachy Mini Camera"
 _AVFOUNDATION_PREFIX = "avfoundation:"
 
 
+def _avfoundation_video_devices() -> dict[str, int]:
+    """Return exact AVFoundation video names mapped to their current indexes."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return {}
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    import re
+
+    devices: dict[str, int] = {}
+    in_video_section = False
+    for line in result.stderr.splitlines():
+        if "AVFoundation video devices:" in line:
+            in_video_section = True
+            continue
+        if "AVFoundation audio devices:" in line:
+            break
+        if not in_video_section:
+            continue
+        match = re.search(r"\[(\d+)\]\s+(.+)$", line.strip())
+        if match:
+            devices[match.group(2).strip()] = int(match.group(1))
+    return devices
+
+
 def _find_named_reachy_camera_macos() -> str | None:
     """Return an exact AVFoundation selector for Reachy Mini.
 
@@ -139,58 +171,6 @@ def _find_named_reachy_camera_macos() -> str | None:
             pass
 
     return None
-
-
-def _find_reachy_camera_index_macos() -> int | None:
-    """Find the Reachy Mini camera index on macOS.
-
-    Strategy: capture a frame from each available camera. The Reachy Mini
-    sits on a desk looking up, so it typically sees a relatively uniform
-    surface (ceiling/wall). We pick the camera with LOWEST image variance —
-    a face/room has high variance, a wall/ceiling has low variance.
-    """
-    candidates: list[tuple[int, float, float]] = []  # (index, variance, fps)
-
-    for i in range(5):
-        cap = cv2.VideoCapture(i)
-        if not cap.isOpened():
-            continue
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        # Read several frames to let auto-exposure settle
-        for _ in range(8):
-            cap.read()
-        ret, frame = cap.read()
-        cap.release()
-
-        if ret and frame is not None and frame.size > 0:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            var = float(gray.var())
-            candidates.append((i, var, fps))
-            logger.info("Camera[%d]: variance=%.0f fps=%.0f", i, var, fps)
-
-    if not candidates:
-        return None
-
-    # Heuristic: Reachy Mini sees uniform surface → lowest variance
-    # AND typically has lower FPS (15 vs 30 for built-in cameras)
-    # Score: low variance + low fps = likely Reachy
-    candidates.sort(key=lambda x: x[1])  # Sort by variance (lowest first)
-
-    # If the lowest-variance camera has fps around 15, it's definitely Reachy
-    best_idx, best_var, best_fps = candidates[0]
-    if abs(best_fps - 15) < 10:
-        logger.info("✅ Reachy Mini at index %d (variance=%.0f, fps=%.0f)", best_idx, best_var, best_fps)
-        return best_idx
-
-    # Check if lowest-variance camera is significantly lower than 2nd
-    if len(candidates) >= 2 and candidates[0][1] < candidates[1][1] * 0.5:
-        logger.info("✅ Reachy Mini at index %d (variance=%.0f, much lower than next=%.0f)",
-                     best_idx, best_var, candidates[1][1])
-        return best_idx
-
-    # Fallback: lowest variance wins
-    logger.info("⚠️ Using index %d as Reachy Mini (lowest variance=%.0f)", best_idx, best_var)
-    return best_idx
 
 
 def _find_reachy_camera_index_linux() -> int | str | None:
@@ -261,18 +241,13 @@ def find_reachy_camera(config_value: int | str = "auto") -> int | str:
         named = _find_named_reachy_camera_macos()
         if named is not None:
             return named
-        idx = _find_reachy_camera_index_macos()
-        if idx is not None:
-            return idx
-        # Never silently open the MacBook camera. Return the named selector
-        # as a best-guess default — if the camera is connected but not
-        # detected by name, FFmpeg will still find it by this name.
-        logger.warning(
-            "Reachy camera not auto-detected — using named selector %r. "
-            "If the camera isn't connected, FFmpeg will report a clear error.",
-            _REACHY_AVFOUNDATION_NAME,
+        # Camera indexes are different between OpenCV and FFmpeg and can also
+        # be reordered by Continuity Camera. Never infer the robot camera from
+        # FPS or image content: those heuristics can select the MacBook camera.
+        raise RuntimeError(
+            "未检测到名为 'Reachy Mini Camera' 的 AVFoundation 设备；"
+            "拒绝回退到 Mac 前置摄像头"
         )
-        return f"{_AVFOUNDATION_PREFIX}{_REACHY_AVFOUNDATION_NAME}"
     elif system == "Linux":
         dev = _find_reachy_camera_index_linux()
         if dev is not None:
@@ -334,62 +309,26 @@ class Camera:
         return True
 
     def _open_named_avfoundation(self) -> bool:
-        """Open Reachy by its stable AVFoundation name via FFmpeg."""
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg is None:
-            logger.error(
-                "Cannot open named Reachy camera: ffmpeg is not installed"
-            )
-            return False
-
+        """Resolve the exact Reachy name, then open its current AVFoundation index."""
         name = self._device.removeprefix(_AVFOUNDATION_PREFIX)
-        # Reachy Mini's UVC camera advertises 1920x1080 at 5 or 60 fps on
-        # macOS.  Capture at 5 fps and scale before JPEG encoding to keep the
-        # dashboard/VLM path lightweight.
-        command = [
-            ffmpeg,
-            "-loglevel",
-            "error",
-            "-f",
-            "avfoundation",
-            "-pixel_format",
-            "nv12",
-            "-framerate",
-            "5",
-            "-video_size",
-            "1920x1080",
-            "-i",
-            f"{name}:none",
-            "-vf",
-            f"scale={self._width}:{self._height}",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "-q:v",
-            "5",
-            "pipe:1",
-        ]
-        try:
-            self._ffmpeg = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-            self._prefetched_jpeg = self._read_ffmpeg_jpeg()
-        except OSError:
-            logger.exception("Cannot start FFmpeg for Reachy camera")
-            self.close()
+        index = _avfoundation_video_devices().get(name)
+        if index is None:
+            logger.error("Exact AVFoundation device not found: %s", name)
             return False
-
-        if self._prefetched_jpeg is None:
-            logger.error("Named Reachy camera opened but produced no frame")
-            self.close()
+        self._cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+        if not self._cap.isOpened():
+            logger.error("Cannot open Reachy AVFoundation index %d", index)
+            self._cap = None
             return False
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
+        for _ in range(5):
+            self._cap.read()
 
         logger.info(
-            "Camera opened by name: device=%s resolution=%dx%d",
+            "Camera opened by exact name: device=%s index=%d resolution=%dx%d",
             name,
+            index,
             self._width,
             self._height,
         )
@@ -506,8 +445,12 @@ class Camera:
 
     @property
     def backend_name(self) -> str:
-        if self._ffmpeg is not None:
-            return "ffmpeg_avfoundation_named"
+        if (
+            platform.system() == "Darwin"
+            and isinstance(self._device, str)
+            and self._device.startswith(_AVFOUNDATION_PREFIX)
+        ):
+            return "opencv_avfoundation_exact_name"
         return "opencv_direct"
 
     def read(self) -> np.ndarray | None:

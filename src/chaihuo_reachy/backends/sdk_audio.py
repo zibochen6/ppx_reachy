@@ -95,8 +95,6 @@ class SdkAudioIO:
         buf = bytearray()
         poll_s = 0.005  # 200 Hz poll rate
         ch = getattr(self, "_input_channel", 0)  # 0=raw, 1=AEC
-        import math as _math
-
         while True:
             try:
                 sample = self._mm.get_audio_sample()
@@ -111,7 +109,7 @@ class SdkAudioIO:
 
                     # Update smoothed capture RMS for diagnostics
                     rms = (
-                        float(_math.sqrt(float(_math.sqrt((mono * mono).mean()))))
+                        float(np.sqrt(np.mean(np.square(mono), dtype=np.float64)))
                         if mono.size
                         else 0.0
                     )

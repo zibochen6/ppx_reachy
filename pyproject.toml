@@ -3,10 +3,11 @@ name = "chaihuo-reachy"
 version = "0.1.0"
 description = "柴火基地车 Reachy Mini 智能语音助手 — ASR/LLM/TTS via 阿里云百炼"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10,<3.11"
 keywords = ["reachy-mini", "voice-assistant", "bailian", "mcv"]
 dependencies = [
-    "numpy>=2.0",
+    "numpy>=2.2.5,<2.3",
+    "onnxruntime==1.23.2",
     "websockets>=15.0,<16",
     "httpx>=0.28.0",
     "sounddevice>=0.4.6",
@@ -27,8 +28,11 @@ dependencies = [
     "uvicorn>=0.30",
     # Reachy daemon lifecycle; app media stays disabled because audio.py owns
     # the one required full-duplex XMOS stream.
-    "reachy-mini>=1.9.0,<2",
+    "reachy-mini==1.9.0rc1",
     "sherpa-onnx>=1.13.4",
+    # sherpa-onnx 1.13.4 split its native runtime into a separate wheel, but
+    # its published resolver metadata does not consistently pull it in.
+    "sherpa-onnx-core==1.13.4",
     "openwakeword>=0.6.0",
     # Beat-dance: decode beat.mp3 → PCM for the ALSA playback pipeline
     "miniaudio>=1.59",
@@ -38,18 +42,26 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "tomli>=2.0; python_version < '3.11'",
+]
+jetson = [
+    # JetPack 6.2 / CUDA 12.6 / Python 3.10 aarch64 build.  Keep the hash in
+    # the direct URL so uv verifies the exact Jetson AI Lab artifact.
+    "torch @ https://pypi.jetson-ai-lab.io/jp6/cu126/+f/62a/1beee9f2f1470/torch-2.8.0-cp310-cp310-linux_aarch64.whl#sha256=62a1beee9f2f147076a974d2942c90060c12771c94740830327cae705b2595fc ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    # --system-site-packages exposes Ubuntu's NumPy-1.x-built pandas.  A venv
+    # copy prevents that optional sklearn import from breaking under NumPy 2.2.
+    "pandas>=2.2,<2.4; sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 
 [project.scripts]
 chaihuo-reachy = "chaihuo_reachy.main:main"
-chaihuo-reachy-sdk = "chaihuo_reachy.reachy_app:main"
-
-[project.entry-points."reachy_mini_apps"]
-chaihuo_reachy = "chaihuo_reachy.reachy_app:ChaihuoReachyApp"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build]
 exclude = [

@@ -103,6 +103,62 @@ class AmapWebClient:
             "source": "amap_ip",
         }
 
+    async def locate_by_wifi(
+        self,
+        access_points: list[dict[str, object]],
+        *,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Locate an IoT device from at least two fixed surrounding APs.
+
+        Raw BSSIDs stay in the request body only and are never put into cache
+        keys, return values or exception messages.
+        """
+        usable = [
+            item for item in access_points if item.get("bssid") and item.get("ssid")
+        ]
+        if len(usable) < 3:
+            raise AmapAPIError("insufficient_wifi", "周边固定 Wi-Fi 少于两个")
+        connected = next((item for item in usable if item.get("connected")), None)
+        if connected is None:
+            raise AmapAPIError("missing_mmac", "未获取到当前连接的 Wi-Fi 信息")
+        surrounding = [item for item in usable if not item.get("connected")][:30]
+        if len(surrounding) < 2:
+            raise AmapAPIError("insufficient_wifi", "周边固定 Wi-Fi 少于两个")
+        params: dict[str, object] = {
+            "accesstype": "2",
+            "macs": "|".join(_format_ap(item) for item in surrounding),
+            "output": "JSON",
+            "show_fields": "formatted_address,addressComponent",
+        }
+        params["mmac"] = _format_ap(connected)
+        # Wi-Fi fingerprints should not be retained in the generic cache.
+        data = await self._request("/v5/position/IoT", params, method="POST")
+        position = data.get("position") or data.get("result") or {}
+        if not isinstance(position, dict):
+            raise AmapAPIError("invalid_position", "高德 Wi-Fi 定位结果无效")
+        location = _text(position.get("location"))
+        try:
+            lon, lat = (float(value) for value in location.split(",", 1))
+        except (TypeError, ValueError):
+            raise AmapAPIError("invalid_coordinates", "高德 Wi-Fi 坐标无效") from None
+        component = position.get("addressComponent") or {}
+        if not isinstance(component, dict):
+            component = {}
+        return {
+            "latitude": lat,
+            "longitude": lon,
+            "radius_m": _float_or_none(position.get("radius")),
+            "place": _text(position.get("formatted_address")),
+            "province": _text(component.get("province")),
+            "city": _text(component.get("city")),
+            "district": _text(component.get("district")),
+            "adcode": _text(component.get("adcode")),
+            "coordinate_system": "GCJ-02",
+            "precision": "point",
+            "source": "amap_wifi",
+        }
+
     async def convert_coordinates(
         self,
         lat: float,
@@ -201,7 +257,13 @@ class AmapWebClient:
             self._cache[cache_key] = (time.monotonic(), data)
             return dict(data)
 
-    async def _request(self, path: str, params: Mapping[str, object]) -> dict[str, Any]:
+    async def _request(
+        self,
+        path: str,
+        params: Mapping[str, object],
+        *,
+        method: str = "GET",
+    ) -> dict[str, Any]:
         request_params: dict[str, object] = {**params, "key": self._key}
         if self._private_key:
             request_params["sig"] = build_signature(request_params, self._private_key)
@@ -217,7 +279,10 @@ class AmapWebClient:
         last_error: Exception | None = None
         for attempt in range(2):
             try:
-                response = await client.get(path, params=request_params)
+                if method == "POST":
+                    response = await client.post(path, data=request_params)
+                else:
+                    response = await client.get(path, params=request_params)
                 response.raise_for_status()
                 data = response.json()
                 if not isinstance(data, dict):
@@ -252,3 +317,17 @@ def _join_place(*parts: str) -> str:
         if part and part not in result:
             result += part
     return result
+
+
+def _format_ap(item: Mapping[str, object]) -> str:
+    bssid = _text(item.get("bssid")).lower()
+    strength = int(float(item.get("signal_dbm") or -80))
+    ssid = _text(item.get("ssid")).replace("|", "").replace(",", "")
+    return f"{bssid},{strength},{ssid},0"
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None

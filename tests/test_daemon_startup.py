@@ -25,8 +25,18 @@ def test_shutdown_backstop_force_exits_once_after_delay(monkeypatch) -> None:
     assert calls == [1]
 
 
+def test_startup_clears_any_persisted_official_app(monkeypatch) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "reachy_mini.daemon.startup_app_config.set_startup_app", calls.append
+    )
+    main_module._clear_persisted_startup_app()
+    assert calls == [None]
+
+
 def test_spawn_uses_real_hardware_mode_by_default(monkeypatch) -> None:
     commands: list[list[str]] = []
+    monkeypatch.setattr(main_module, "_clear_persisted_startup_app", lambda: None)
     monkeypatch.setattr("shutil.which", lambda _name: "/usr/local/bin/reachy-mini-daemon")
     monkeypatch.setattr(
         "subprocess.Popen",
@@ -39,15 +49,27 @@ def test_spawn_uses_real_hardware_mode_by_default(monkeypatch) -> None:
     assert commands == [
         [
             "/usr/local/bin/reachy-mini-daemon",
+            "--autostart",
+            "--headless",
+            "--no-wake-up-on-start",
+            "--goto-sleep-on-stop",
             "--serialport",
             "/dev/cu.usbmodem-test",
         ],
-        ["/usr/local/bin/reachy-mini-daemon", "--sim"],
+        [
+            "/usr/local/bin/reachy-mini-daemon",
+            "--autostart",
+            "--headless",
+            "--no-wake-up-on-start",
+            "--goto-sleep-on-stop",
+            "--sim",
+        ],
     ]
 
 
 def test_spawn_passes_no_media_to_prevent_direct_backend_conflict(monkeypatch) -> None:
     commands: list[list[str]] = []
+    monkeypatch.setattr(main_module, "_clear_persisted_startup_app", lambda: None)
     monkeypatch.setattr("shutil.which", lambda _name: "/usr/local/bin/reachy-mini-daemon")
     monkeypatch.setattr(
         "subprocess.Popen",
@@ -73,6 +95,7 @@ def test_spawn_finds_daemon_beside_venv_python_when_path_is_minimal(
     python.symlink_to(real_python)
     daemon.touch(mode=0o755)
     commands: list[list[str]] = []
+    monkeypatch.setattr(main_module, "_clear_persisted_startup_app", lambda: None)
 
     monkeypatch.setattr("shutil.which", lambda _name: None)
     monkeypatch.setattr(main_module.sys, "executable", str(python))
@@ -83,7 +106,14 @@ def test_spawn_finds_daemon_beside_venv_python_when_path_is_minimal(
 
     main_module._spawn_sdk_daemon_process(Config(daemon_simulation=True))
 
-    assert commands == [[str(daemon), "--sim"]]
+    assert commands == [[
+        str(daemon),
+        "--autostart",
+        "--headless",
+        "--no-wake-up-on-start",
+        "--goto-sleep-on-stop",
+        "--sim",
+    ]]
 
 
 def test_resolve_serial_recovers_only_unique_candidate(monkeypatch, tmp_path) -> None:

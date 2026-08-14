@@ -1,38 +1,41 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import time
-import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
+
 
 ROOT = Path(__file__).parents[1]
 
 
-def test_package_declares_sdk_dependency_and_app_entrypoint() -> None:
+def test_package_pins_sdk_and_has_only_one_public_cli() -> None:
     metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert any(dep.startswith("reachy-mini>=1.9.0") for dep in metadata["project"]["dependencies"])
-    assert metadata["project"]["entry-points"]["reachy_mini_apps"]["chaihuo_reachy"].endswith(
-        ":ChaihuoReachyApp"
+    assert metadata["project"]["requires-python"] == ">=3.10,<3.11"
+    assert "reachy-mini==1.9.0rc1" in metadata["project"]["dependencies"]
+    assert "numpy>=2.2.5,<2.3" in metadata["project"]["dependencies"]
+    assert "onnxruntime==1.23.2" in metadata["project"]["dependencies"]
+    assert any(
+        "torch-2.8.0-cp310-cp310-linux_aarch64.whl" in dependency
+        and "sha256=62a1beee9f2f147076a974d2942c90060c12771c94740830327cae705b2595fc"
+        in dependency
+        for dependency in metadata["project"]["optional-dependencies"]["jetson"]
     )
+    assert metadata["project"]["scripts"] == {
+        "chaihuo-reachy": "chaihuo_reachy.main:main"
+    }
+    assert "entry-points" not in metadata["project"]
 
 
-def test_sdk_app_contract_when_dependency_is_installed() -> None:
-    pytest.importorskip("reachy_mini")
-    from reachy_mini import ReachyMiniApp
-    from chaihuo_reachy.reachy_app import ChaihuoReachyApp
-
-    assert issubclass(ChaihuoReachyApp, ReachyMiniApp)
-    assert ChaihuoReachyApp.request_media_backend in ("no_media", "local")
-    assert list(inspect.signature(ChaihuoReachyApp.run).parameters) == [
-        "self",
-        "reachy_mini",
-        "stop_event",
-    ]
+def test_reachy_app_wrapper_is_removed() -> None:
+    assert not (ROOT / "src/chaihuo_reachy/reachy_app.py").exists()
 
 
 @pytest.mark.asyncio
@@ -59,6 +62,9 @@ async def test_daemon_spawn_timeout_polls_same_process_until_ready(monkeypatch) 
                 raise ConnectionError("still starting")
             self.media_manager = object()
             self.client = SimpleNamespace(host="localhost")
+
+        def enable_motors(self) -> None:
+            return None
 
         def wake_up(self) -> None:
             return None
@@ -101,6 +107,20 @@ async def test_daemon_spawn_timeout_polls_same_process_until_ready(monkeypatch) 
     assert status["robot_ready"] is True
     assert reachy._chaihuo_daemon_process is process
     assert [call["spawn_daemon"] for call in calls] == [False, False]
+
+
+@pytest.mark.asyncio
+async def test_main_wake_enables_motors_before_wake_up() -> None:
+    from chaihuo_reachy import main as main_module
+
+    calls: list[str] = []
+    reachy = SimpleNamespace(
+        enable_motors=lambda: calls.append("enable_motors"),
+        wake_up=lambda: calls.append("wake_up"),
+    )
+
+    assert await main_module._wake_up_reachy(reachy, attempts=1)
+    assert calls == ["enable_motors", "wake_up"]
 
 
 @pytest.mark.asyncio

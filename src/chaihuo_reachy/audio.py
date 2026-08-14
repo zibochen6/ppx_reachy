@@ -278,6 +278,7 @@ class DuplexAudioIO:
         )  # default to AEC channel
 
         self._duplex_stream: sd.RawStream | None = None
+        self._output_stream: sd.OutputStream | None = None
         self._in_ch = 1
         self._out_ch = 1
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -374,9 +375,41 @@ class DuplexAudioIO:
         self._alsa_threads.append(thread)
         logger.info("Playback thread started (no active capture)")
 
+    def _ensure_output_stream(self) -> None:
+        """Open a dedicated playback-only stream when no capture session is up.
+
+        The duplex stream is torn down at the end of every listen turn, but
+        dance music / TTS can be queued right after — with no consumer the
+        playback buffer just grows silently.  The ALSA backend already runs
+        a dedicated playback thread for this (see above); this is the
+        sounddevice equivalent.  Closed again when a capture session opens
+        or on full ``close()``.
+        """
+        if self._alsa or self._duplex_stream is not None or self._output_stream is not None:
+            return
+        for out_ch in dict.fromkeys((self._out_ch, 2, 1)):
+            try:
+                stream = sd.OutputStream(
+                    samplerate=self.input_sr,
+                    blocksize=self._chunk_frames,
+                    device=self.output_device,
+                    channels=out_ch,
+                    dtype="int16",
+                    callback=self._output_cb,
+                )
+                stream.start()
+            except Exception:
+                continue
+            self._out_ch = out_ch
+            self._output_stream = stream
+            logger.info("Playback-only stream opened (ch=%d)", out_ch)
+            return
+        logger.warning("无法打开独立播放流，音乐将在下一次拾音会话中播放")
+
     async def play(self, pcm: bytes) -> None:
         """Queue PCM audio for playback. Resamples if needed."""
         self._ensure_playback_thread()
+        self._ensure_output_stream()
         if self._playback_sample_rate != self.output_sr:
             pcm = self._resample_pcm(pcm, self._playback_sample_rate, self.output_sr)
         with self._playback_lock:
@@ -506,6 +539,15 @@ class DuplexAudioIO:
                 logger.warning("ALSA 后端打开失败（%r），回退 sounddevice", exc)
                 self._close_duplex(keep_playback=False)
                 self._alsa = False
+        # A playback-only stream from a previous idle stretch must not keep
+        # the device busy or double-consume the buffer once capture starts.
+        if self._output_stream is not None:
+            try:
+                self._output_stream.stop()
+                self._output_stream.close()
+            except Exception:
+                pass
+            self._output_stream = None
         last_err: Exception | None = None
         channel_options = [
             (in_ch, out_ch)
@@ -597,6 +639,13 @@ class DuplexAudioIO:
             except Exception:
                 pass
             self._duplex_stream = None
+        if not keep_playback and getattr(self, "_output_stream", None) is not None:
+            try:
+                self._output_stream.stop()
+                self._output_stream.close()
+            except Exception:
+                pass
+            self._output_stream = None
 
     # ── ALSA direct backend ────────────────────────────────────────────
     def _open_alsa_duplex(self) -> None:
@@ -815,38 +864,64 @@ class DuplexAudioIO:
 
         # ── Playback ──
         try:
-            need_mono = frames * 2  # int16 mono bytes
-            with self._playback_lock:
-                n = min(need_mono, len(self._playback_buffer))
-                mono = bytes(self._playback_buffer[:n])
-                del self._playback_buffer[:n]
-
-            if n > 0:
-                s = np.frombuffer(mono, dtype=np.int16).astype(np.float32) / 32768.0
-                # Apply the Dashboard-controlled PCM gain before limiting.
-                vol = getattr(self, "_volume", 1.0)
-                s = s * vol
-                # Soft clip to prevent harsh distortion
-                s = np.tanh(s)
-                mono = (np.clip(s, -0.99, 0.99) * 32767.0).astype(np.int16).tobytes()
-                rms = float(np.sqrt(np.mean(s * s))) if s.size else 0.0
-            else:
-                rms = 0.0
-            self._play_rms = getattr(self, "_play_rms", 0.0)
-            self._play_rms += 0.3 * (rms - self._play_rms)
-
-            if n < need_mono:
-                mono += b"\x00" * (need_mono - n)
-            self._notify_playback_observer(mono)
-            if self._out_ch == 1:
-                out = mono
-            else:
-                y = np.frombuffer(mono, dtype=np.int16)
-                out = np.repeat(y[:, None], self._out_ch, axis=1).tobytes()
-            outdata[: len(out)] = out
+            mono = self._render_output(frames)
+            self._write_output(outdata, mono)
         except Exception:
             logger.debug("duplex playback error", exc_info=True)
-            outdata[:] = b"\x00" * len(outdata)
+            outdata.fill(0)
+
+    def _render_output(self, frames: int) -> bytes:
+        """Drain the playback buffer into one int16 mono chunk (gain applied).
+
+        Shared by the duplex callback and the playback-only stream callback:
+        pops up to ``frames`` samples, applies the Dashboard volume with
+        soft clipping, smooths ``_play_rms``, pads short reads with silence,
+        and feeds the playback observer.  Never blocks on the lock beyond
+        the slice copy.
+        """
+        need_mono = frames * 2  # int16 mono bytes
+        with self._playback_lock:
+            n = min(need_mono, len(self._playback_buffer))
+            mono = bytes(self._playback_buffer[:n])
+            del self._playback_buffer[:n]
+
+        if n > 0:
+            s = np.frombuffer(mono, dtype=np.int16).astype(np.float32) / 32768.0
+            # Apply the Dashboard-controlled PCM gain before limiting.
+            vol = getattr(self, "_volume", 1.0)
+            s = s * vol
+            # Soft clip to prevent harsh distortion
+            s = np.tanh(s)
+            mono = (np.clip(s, -0.99, 0.99) * 32767.0).astype(np.int16).tobytes()
+            rms = float(np.sqrt(np.mean(s * s))) if s.size else 0.0
+        else:
+            rms = 0.0
+        self._play_rms = getattr(self, "_play_rms", 0.0)
+        self._play_rms += 0.3 * (rms - self._play_rms)
+
+        if n < need_mono:
+            mono += b"\x00" * (need_mono - n)
+        self._notify_playback_observer(mono)
+        return mono
+
+    def _write_output(self, outdata, mono: bytes) -> None:
+        """Write one mono int16 chunk into the stream buffer (ch-aware)."""
+        if self._out_ch == 1:
+            out = np.frombuffer(mono, dtype=np.int16)
+        else:
+            y = np.frombuffer(mono, dtype=np.int16)
+            out = np.repeat(y[:, None], self._out_ch, axis=1)
+        n = min(len(out), len(outdata))
+        outdata[:n] = out[:n]
+
+    def _output_cb(self, outdata, frames, time_info, status) -> None:
+        """Playback-only stream callback — drains the shared buffer."""
+        try:
+            mono = self._render_output(frames)
+            self._write_output(outdata, mono)
+        except Exception:
+            logger.debug("output stream playback error", exc_info=True)
+            outdata.fill(0)
 
     def _safe_put(self, buf: bytes) -> None:
         """Thread-safe queue insertion from the audio callback."""

@@ -3,7 +3,8 @@
 Positioning backends, in priority order:
   1. GPSD       — real GPS hardware via gpsd daemon (Jetson / Linux)
   2. Browser    — Dashboard navigator.geolocation (macOS CoreLocation Wi-Fi)
-  3. Manual     — user-configured fixed coordinates
+  3. AMap IoT   — Jetson NetworkManager surrounding Wi-Fi fingerprints
+  4. AMap IP    — city-level fallback without fabricated coordinates
 
 Usage::
 
@@ -22,6 +23,7 @@ import time
 from dataclasses import dataclass, field
 
 from chaihuo_reachy.amap import AmapAPIError, AmapWebClient
+from chaihuo_reachy.wifi_scan import NetworkManagerWifiScanner
 
 logger = logging.getLogger("chaihuo_reachy.location")
 
@@ -32,12 +34,15 @@ logger = logging.getLogger("chaihuo_reachy.location")
 class Position:
     lat: float | None
     lon: float | None
-    source: str = "unknown"  # "gpsd" | "browser" | "manual" | "unavailable"
+    source: str = "unknown"
     timestamp: float = field(default_factory=time.time)
     altitude_m: float | None = None
     speed_kmh: float | None = None
     heading_deg: float | None = None
     accuracy_m: float | None = None  # browser provides this
+    radius_m: float | None = None
+    coordinate_system: str = "WGS84"
+    stale_after_s: float = 30.0
     address: str | None = None
     province: str = ""
     city: str = ""
@@ -47,6 +52,7 @@ class Position:
     error: str = ""
 
     def to_dict(self) -> dict[str, object]:
+        age_s = max(0.0, time.time() - self.timestamp)
         return {
             "lat": round(self.lat, 6) if self.lat is not None else None,
             "lon": round(self.lon, 6) if self.lon is not None else None,
@@ -64,6 +70,12 @@ class Position:
             "accuracy_m": round(self.accuracy_m, 1)
             if self.accuracy_m is not None
             else None,
+            "radius_m": round(self.radius_m, 1)
+            if self.radius_m is not None
+            else None,
+            "coordinate_system": self.coordinate_system,
+            "age_s": round(age_s, 1),
+            "is_stale": age_s > self.stale_after_s,
             "address": self.address,
             "province": self.province,
             "city": self.city,
@@ -90,7 +102,7 @@ class Position:
             "gpsd": "🛰 GPS卫星",
             "browser": "📱 设备定位",
             "amap_ip": "🌐 高德IP城市定位",
-            "manual": "📍 手动设置",
+            "amap_wifi": "📶 高德Wi-Fi定位",
             "unavailable": "❌ 无信号",
         }
         parts.append(source_labels.get(self.source, self.source))
@@ -132,7 +144,7 @@ class Position:
 class LocationService:
     """Multi-source location provider.
 
-    Priority: GPSD (satellite) > Browser (Wi-Fi/CoreLocation) > Manual.
+    Priority: GPSD > Browser > AMap Wi-Fi > AMap IP > unavailable.
     """
 
     def __init__(
@@ -144,6 +156,9 @@ class LocationService:
         stale_timeout_s: float = 30.0,
         browser_stale_timeout_s: float = 60.0,
         amap_client: AmapWebClient | None = None,
+        wifi_scanner: NetworkManagerWifiScanner | None = None,
+        wifi_scan_interval_s: float = 10.0,
+        wifi_stale_timeout_s: float = 30.0,
     ) -> None:
         self._gpsd_host = gpsd_host
         self._gpsd_port = gpsd_port
@@ -151,11 +166,14 @@ class LocationService:
         self._stale_timeout_s = stale_timeout_s
         self._browser_stale_timeout_s = browser_stale_timeout_s
         self._amap = amap_client
+        self._wifi_scanner = wifi_scanner
+        self._wifi_scan_interval_s = max(2.0, wifi_scan_interval_s)
+        self._wifi_stale_timeout_s = max(5.0, wifi_stale_timeout_s)
 
         self._latest: Position | None = None
         self._browser_pos: Position | None = None  # latest from Dashboard JS
-        self._manual_lat: float | None = None
-        self._manual_lon: float | None = None
+        self._wifi_pos: Position | None = None
+        self._last_wifi_scan_at = 0.0
         self._running = False
         self._task: asyncio.Task | None = None
 
@@ -202,6 +220,8 @@ class LocationService:
             lat=lat,
             lon=lon,
             source="browser",
+            coordinate_system="WGS84",
+            stale_after_s=self._browser_stale_timeout_s,
             accuracy_m=accuracy_m,
             altitude_m=altitude_m,
             heading_deg=heading_deg,
@@ -236,6 +256,12 @@ class LocationService:
             and now - self._browser_pos.timestamp < self._browser_stale_timeout_s
         ):
             return self._browser_pos
+        if (
+            not refresh
+            and self._wifi_pos is not None
+            and now - self._wifi_pos.timestamp < self._wifi_stale_timeout_s
+        ):
+            return self._wifi_pos
         # Try GPSD once. A real satellite fix remains the highest live source.
         pos = await self._poll_gpsd()
         if pos is not None:
@@ -249,6 +275,12 @@ class LocationService:
         ):
             self._latest = self._browser_pos
             return self._browser_pos
+        # Jetson unattended positioning: fixed surrounding AP fingerprints.
+        if self._wifi_scanner is not None and self._amap is not None:
+            wifi = await self._poll_amap_wifi(force=refresh)
+            if wifi is not None:
+                self._latest = wifi
+                return wifi
         # IP location is city-level, but better than a stale or fabricated fix.
         if self._amap is not None and self._amap.available:
             try:
@@ -262,6 +294,8 @@ class LocationService:
                     city=str(item.get("city") or ""),
                     adcode=str(item.get("adcode") or ""),
                     precision="city",
+                    coordinate_system="unknown",
+                    stale_after_s=600.0,
                 )
                 self._latest = pos
                 return pos
@@ -282,19 +316,48 @@ class LocationService:
             error=error,
         )
 
-    def set_manual(self, lat: float, lon: float) -> Position:
-        """Manually override position."""
-        self._manual_lat = lat
-        self._manual_lon = lon
-        self._latest = Position(
-            lat=lat,
-            lon=lon,
-            source="manual",
-            address=f"手动设置 ({lat:.4f}, {lon:.4f})",
+    async def _poll_amap_wifi(self, *, force: bool = False) -> Position | None:
+        now = time.monotonic()
+        if not force and now - self._last_wifi_scan_at < self._wifi_scan_interval_s:
+            return self._wifi_pos
+        self._last_wifi_scan_at = now
+        assert self._wifi_scanner is not None and self._amap is not None
+        points = await self._wifi_scanner.scan()
+        # A connected phone hotspot moves with the vehicle and is not a useful
+        # surrounding fingerprint. Only non-connected APs count toward two.
+        surroundings = [item for item in points if not item.connected]
+        if len(surroundings) < 2 or not any(item.connected for item in points):
+            logger.info("📍 Wi-Fi 定位跳过：固定周边热点不足 2 个")
+            return None
+        try:
+            item = await self._amap.locate_by_wifi(
+                [point.to_amap() for point in points]
+            )
+        except AmapAPIError as exc:
+            logger.warning("高德 Wi-Fi 定位不可用: %s", exc)
+            return None
+        pos = Position(
+            lat=float(item["latitude"]),
+            lon=float(item["longitude"]),
+            source="amap_wifi",
+            radius_m=item.get("radius_m"),
+            accuracy_m=item.get("radius_m"),
+            coordinate_system="GCJ-02",
+            stale_after_s=self._wifi_stale_timeout_s,
+            address=str(item.get("place") or ""),
+            province=str(item.get("province") or ""),
+            city=str(item.get("city") or ""),
+            district=str(item.get("district") or ""),
+            adcode=str(item.get("adcode") or ""),
             precision="point",
         )
-        logger.info("📍 手动位置: %.6f, %.6f", lat, lon)
-        return self._latest
+        self._wifi_pos = pos
+        logger.info(
+            "📍 高德 Wi-Fi 定位成功 (radius=%.0fm, AP=%d)",
+            pos.radius_m or 0.0,
+            len(surroundings),
+        )
+        return pos
 
     @property
     def latest_position(self) -> Position | None:
@@ -353,6 +416,8 @@ class LocationService:
                         lat=float(lat),
                         lon=float(lon),
                         source="gpsd",
+                        coordinate_system="WGS84",
+                        stale_after_s=self._stale_timeout_s,
                         altitude_m=float(alt) if alt is not None else None,
                         speed_kmh=float(speed_ms) * 3.6
                         if speed_ms is not None
@@ -421,6 +486,10 @@ class LocationService:
                     # Enrich GPS fixes with address
                     if not pos.address:
                         asyncio.ensure_future(self._enrich_with_address(pos))
+                elif self._wifi_scanner is not None and self._amap is not None:
+                    wifi = await self._poll_amap_wifi()
+                    if wifi is not None:
+                        self._latest = wifi
             except asyncio.CancelledError:
                 return
             except Exception:
@@ -500,6 +569,9 @@ def create_location_service(
     amap_web_private_key: str = "",
     amap_timeout_s: float = 3.0,
     amap_cache_ttl_s: float = 600.0,
+    wifi_enabled: bool = True,
+    wifi_scan_interval_s: float = 10.0,
+    wifi_fresh_s: float = 30.0,
 ) -> LocationService:
     """Create a LocationService from explicit parameters."""
     amap_client = (
@@ -519,4 +591,9 @@ def create_location_service(
         stale_timeout_s=gps_fresh_s,
         browser_stale_timeout_s=browser_fresh_s,
         amap_client=amap_client,
+        wifi_scanner=NetworkManagerWifiScanner()
+        if wifi_enabled and amap_client is not None
+        else None,
+        wifi_scan_interval_s=wifi_scan_interval_s,
+        wifi_stale_timeout_s=wifi_fresh_s,
     )

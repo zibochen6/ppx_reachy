@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
 from chaihuo_reachy.config import Config
 from chaihuo_reachy.engine import ConversationEngine
 from chaihuo_reachy.location import LocationService, Position
+from chaihuo_reachy.wifi_scan import WifiAccessPoint
 
 
 class _FakeAmap:
@@ -61,8 +63,58 @@ async def test_amap_ip_fallback_has_no_fake_coordinates() -> None:
     assert result.lat is None and result.lon is None
 
 
+def test_position_reports_coordinate_system_radius_age_and_staleness() -> None:
+    position = Position(
+        40.0,
+        116.3,
+        source="amap_wifi",
+        timestamp=time.time() - 31,
+        radius_m=80,
+        coordinate_system="GCJ-02",
+        stale_after_s=30,
+    ).to_dict()
+    assert position["coordinate_system"] == "GCJ-02"
+    assert position["radius_m"] == 80
+    assert position["age_s"] >= 31
+    assert position["is_stale"] is True
+
+
 @pytest.mark.asyncio
-async def test_session_location_wins_and_clears_with_conversation() -> None:
+async def test_wifi_point_wins_before_ip_city_fallback() -> None:
+    class Scanner:
+        async def scan(self):
+            return [
+                WifiAccessPoint("00:11:22:33:44:55", -50, "hotspot", True),
+                WifiAccessPoint("10:20:30:40:50:60", -60, "shop"),
+                WifiAccessPoint("20:21:22:23:24:25", -70, "office"),
+            ]
+
+    class Amap(_FakeAmap):
+        async def locate_by_wifi(self, _points):
+            return {
+                "latitude": 40.001,
+                "longitude": 116.326,
+                "radius_m": 85,
+                "place": "北京市海淀区",
+                "province": "北京市",
+                "city": "北京市",
+                "district": "海淀区",
+                "adcode": "110108",
+            }
+
+    amap = Amap()
+    service = LocationService(
+        gpsd_host="", amap_client=amap, wifi_scanner=Scanner()  # type: ignore[arg-type]
+    )
+    result = await service.get_position()
+    assert result.source == "amap_wifi"
+    assert result.coordinate_system == "GCJ-02"
+    assert result.radius_m == 85
+    assert amap.ip_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_live_location_wins_over_session_note_and_note_clears() -> None:
     class LiveLocation:
         async def get_position(self, *, refresh: bool = False):
             return Position(
@@ -74,8 +126,8 @@ async def test_session_location_wins_and_clears_with_conversation() -> None:
     engine._set_session_location("北京清华大学")
 
     session = await engine._tool_get_current_location()
-    assert session["place"] == "北京清华大学"
-    assert session["source"] == "session_user"
+    assert session["place"] == "北京市"
+    assert session["source"] == "gpsd"
 
     engine.clear_conversation()
     live = await engine._tool_get_current_location()
@@ -97,5 +149,6 @@ async def test_registered_location_tool_appends_structured_tool_result() -> None
     assert result[-2]["tool_calls"][0]["function"]["name"] == "get_current_location"
     assert result[-1]["role"] == "tool"
     payload = json.loads(result[-1]["content"])
-    assert payload["place"] == "北京清华大学"
-    assert payload["precision"] == "point"
+    assert payload["place"] == ""
+    assert payload["source"] == "unavailable"
+    assert payload["session_note"] == "北京清华大学"

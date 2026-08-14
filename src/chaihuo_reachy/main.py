@@ -148,11 +148,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;backg
     <div style="font-size:.65rem;color:var(--t);line-height:1.5" id="locDetail">
       <div style="color:var(--m)">定位中...</div>
     </div>
-    <div class="row" style="margin-top:.3rem">
-      <input type="text" id="locManualLat" placeholder="纬度" style="width:50%;background:var(--bg);border:1px solid var(--b);border-radius:4px;color:var(--t);padding:2px 4px;font-size:.6rem">
-      <input type="text" id="locManualLon" placeholder="经度" style="width:50%;background:var(--bg);border:1px solid var(--b);border-radius:4px;color:var(--t);padding:2px 4px;font-size:.6rem;margin-left:.2rem">
-    </div>
-    <button class="btn sm" onclick="setManualLoc()" style="margin-top:.2rem">📍 手动设置位置</button>
   </div>
   <div class="vol">
     <label>🔊 扬声器音量</label>
@@ -164,7 +159,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;backg
   <button class="btn" onclick="snapshot()">📷 拍照分析</button>
   <div style="margin-top:.3rem;padding-top:.3rem;border-top:1px solid rgba(255,255,255,.1)">
     <div style="font-size:.6rem;color:var(--m);margin-bottom:.2rem">🤖 机器人动作</div>
-    <button class="btn sm" onclick="sendMotion('motion_dance',{style:'happy'})">💃 跳舞</button>
+    <button class="btn sm" onclick="sendMotion('motion_dance',{style:'random'})">💃 跳舞</button>
     <button class="btn sm" onclick="sendMotion('motion_nod')">🙆 点头</button>
     <button class="btn sm" onclick="sendMotion('motion_shake_head')">🙅 摇头</button>
     <button class="btn sm" onclick="sendMotion('motion_wave')">🐜 挥天线</button>
@@ -175,7 +170,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;backg
     <div id="audioInfo">🎤 音频设备解析中…</div>
     <div>📷 Reachy Mini Camera</div>
     <div id="sdkInfo">🔌 Standalone 模式</div>
-    <div>🤖 qwen-turbo · qwen3-tts</div>
+    <div id="modelInfo">🤖 模型解析中…</div>
     <div style="margin-top:.3rem"><span id="wsDot">●</span> <span id="wsTxt">连接中</span> · <span id="evtN">0</span>事件</div>
     <div style="font-size:.55rem;color:var(--glow);margin-top:.2rem" id="stDbg"></div>
     <div style="font-size:.6rem;color:var(--m);margin-top:.2rem" id="motionState">🤖 就绪</div>
@@ -318,10 +313,11 @@ function onMsg(m){
       $('audioInfo').textContent='🎤 ['+a.input.index+'] '+a.input.name+' · '+a.input.max_channels+'in/'+a.output.max_channels+'out'+chInfo;
     }else{$('audioInfo').textContent='🎤 音频未就绪';}
     $('sdkInfo').textContent=m.sdk_connected?'🔌 Reachy SDK 已连接':'🔌 Standalone 模式';
+    $('modelInfo').textContent='🤖 '+(m.model||'unknown')+' · 搜索 '+(m.search_policy||'off');
     // Update location display
     if(m.location){
       var loc=m.location;
-      var srcLabel={'gpsd':'🛰 GPS卫星','browser':'📱 设备定位','amap_ip':'🌐 高德IP城市定位','session_user':'📍 会话位置','configured_fallback':'📌 默认城市','manual':'📍 手动设置','unavailable':'❌ 无信号'};
+      var srcLabel={'gpsd':'🛰 GPS卫星','browser':'📱 设备定位','amap_wifi':'📶 高德Wi-Fi定位','amap_ip':'🌐 高德IP城市定位','unavailable':'❌ 无信号'};
       $('locSrc').textContent=srcLabel[loc.source]||loc.source;
       $('locSrc').className='val '+(loc.source==='gpsd'?'ok':loc.source==='unavailable'?'err':'');
       var detail=(loc.lat!=null&&loc.lon!=null)?('坐标: '+loc.lat.toFixed(4)+'°, '+loc.lon.toFixed(4)+'°'):'精度: '+(loc.precision==='city'?'城市级':'未提供坐标');
@@ -495,13 +491,6 @@ function toggleSearch(){
 
 function snapshot(){if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'snapshot'}));}
 function sendMotion(type,data){if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:type,...(data||{})}));}
-function setManualLoc(){
-  var lat=parseFloat($('locManualLat').value);
-  var lon=parseFloat($('locManualLon').value);
-  if(isNaN(lat)||isNaN(lon)){alert('请输入有效的经纬度（如 22.5431, 113.9544）');return;}
-  if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:'set_location',lat:lat,lon:lon}));
-}
-
 // ── Browser geolocation (macOS CoreLocation → Wi-Fi positioning) ──
 var _geoWatchId=null;
 function startGeoTracking(){
@@ -588,6 +577,7 @@ class _MJPEGStream:
         self._running = False
         self._lock = threading.Lock()
         self._latest_jpeg: bytes = b""
+        self._latest_bgr: np.ndarray | None = None
         self._frame_time = 0.0
 
     def start(self) -> bool:
@@ -638,6 +628,7 @@ class _MJPEGStream:
             if ret and frame is not None:
                 _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
                 with self._lock:
+                    self._latest_bgr = frame.copy()
                     self._latest_jpeg = jpeg.tobytes()
                     self._frame_time = time.monotonic()
             time.sleep(interval)
@@ -649,7 +640,23 @@ class _MJPEGStream:
         _last_warn = 0.0
         _quality_checked = 0
         while self._running and self._backend is not None:
-            jpeg = self._backend.capture_jpeg(quality=75)
+            bgr = None
+            try:
+                # One physical read feeds MJPEG, VLM snapshots and pose inference.
+                bgr = self._backend.read()
+            except Exception:
+                logger.debug("共享相机 BGR 帧读取失败", exc_info=True)
+            jpeg = None
+            if bgr is not None:
+                ok, encoded = cv2.imencode(
+                    ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 75]
+                )
+                if ok:
+                    jpeg = encoded.tobytes()
+            else:
+                # Compatibility for minimal/test camera backends that only
+                # expose JPEG capture. Production backends implement read().
+                jpeg = self._backend.capture_jpeg(quality=75)
             if jpeg and jpeg[:2] == b"\xff\xd8":
                 # Quick periodic darkness check (every ~30 frames) — only for
                 # logging, never blocks the frame from reaching the stream.
@@ -668,6 +675,7 @@ class _MJPEGStream:
                     except Exception:
                         pass
                 with self._lock:
+                    self._latest_bgr = bgr.copy() if bgr is not None else None
                     self._latest_jpeg = jpeg
                     self._frame_time = time.monotonic()
                 _failures = 0
@@ -685,6 +693,11 @@ class _MJPEGStream:
     def get_frame(self) -> bytes:
         with self._lock:
             return self._latest_jpeg
+
+    def get_bgr_frame(self) -> np.ndarray | None:
+        """Return a copy of the shared latest BGR frame for local inference."""
+        with self._lock:
+            return self._latest_bgr.copy() if self._latest_bgr is not None else None
 
     async def capture_fresh(self, timeout_s: float = 1.5) -> bytes | None:
         """Wait for a frame produced after this capture request."""
@@ -771,7 +784,10 @@ async def run_dashboard(
         beat_dance=beat_dance,
     )
 
-    mjpeg = _MJPEGStream(camera_backend=camera_backend, fps=10)
+    mjpeg = _MJPEGStream(
+        camera_backend=camera_backend,
+        fps=max(10, int(round(cfg.gesture_inference_fps))),
+    )
     mjpeg_ok = mjpeg.start()
     engine.set_camera_snapshot_provider(mjpeg.capture_fresh)
 
@@ -782,6 +798,9 @@ async def run_dashboard(
         capture_limit=cfg.capture_history_limit,
     )
     sdk_status = dict(sdk_status or {"sdk_connected": False, "mode": "standalone"})
+    gesture: Any | None = None
+    gesture_session: dict[str, Any] = {"wake_word_enabled": None}
+    motion_tasks: set[asyncio.Task[Any]] = set()
 
     def broadcast(msg: dict[str, Any]) -> None:
         hub.publish(msg)
@@ -875,13 +894,73 @@ async def run_dashboard(
                     else 80,
                 },
                 {"type": "wake_word", "enabled": cfg.enable_wake_word},
-                {"type": "search", "enabled": cfg.enable_search},
+                {"type": "search", "enabled": cfg.search_policy != "off", "policy": cfg.search_policy},
                 {"type": "runtime_status", **runtime},
+                gesture.status()
+                if gesture is not None
+                else {
+                    "type": "gesture_status",
+                    "active": False,
+                    "state": "DISABLED",
+                    "gesture": "OTHER",
+                    "finger_states": {},
+                    "landmarks": [],
+                },
                 chat.history_event(),
             ]
 
         async def _handle_control(client: WebSocket, data: dict[str, Any]) -> None:
             event_type = data.get("type", "")
+            if event_type == "gesture_mode":
+                if gesture is None:
+                    await client.send_json(
+                        {"type": "error", "message": "手势控制器尚未就绪"}
+                    )
+                    return
+                action = str(data.get("action") or "")
+                if action == "start":
+                    if gesture.active:
+                        await client.send_json(gesture.status())
+                        return
+                    await _cancel_motion_tasks()
+                    gesture_session["wake_word_enabled"] = cfg.enable_wake_word
+                    engine.set_wake_word_enabled(False)
+                    await engine.set_external_interaction(True)
+                    try:
+                        status = await gesture.start()
+                    except Exception as exc:
+                        await engine.set_external_interaction(False)
+                        previous = gesture_session.pop("wake_word_enabled", False)
+                        engine.set_wake_word_enabled(bool(previous))
+                        await client.send_json(
+                            {"type": "error", "message": f"手势模式启动失败：{exc}"}
+                        )
+                        return
+                    broadcast({"type": "wake_word", "enabled": False})
+                    broadcast(status)
+                elif action == "stop":
+                    await gesture.stop()
+                    await engine.set_external_interaction(False)
+                    previous = gesture_session.pop("wake_word_enabled", False)
+                    engine.set_wake_word_enabled(bool(previous))
+                    broadcast({"type": "wake_word", "enabled": bool(previous)})
+                    broadcast(gesture.status())
+                else:
+                    await client.send_json(
+                        {"type": "error", "message": "gesture_mode action 必须为 start 或 stop"}
+                    )
+                return
+            if gesture is not None and gesture.active and event_type not in {
+                "get_volume",
+                "set_volume",
+                "get_state",
+                "get_runtime_status",
+                "get_gesture_status",
+            }:
+                await client.send_json(
+                    {"type": "error", "message": "手势模式占用中，请先退出手势交互"}
+                )
+                return
             if event_type == "get_volume":
                 volume = (
                     playback_percent_from_gain(engine._audio.volume)
@@ -912,14 +991,17 @@ async def run_dashboard(
                 await client.send_json({"type": "state", "state": engine._state})
             elif event_type == "set_search":
                 enabled = bool(data.get("enabled", False))
+                cfg.search_policy = "auto" if enabled else "off"
                 cfg.enable_search = enabled
-                broadcast({"type": "search", "enabled": enabled})
+                broadcast({"type": "search", "enabled": enabled, "policy": cfg.search_policy})
             elif event_type == "get_search":
-                await client.send_json({"type": "search", "enabled": cfg.enable_search})
+                await client.send_json({"type": "search", "enabled": cfg.search_policy != "off", "policy": cfg.search_policy})
             elif event_type == "get_runtime_status":
                 await client.send_json(
                     {"type": "runtime_status", **engine.runtime_status(), **sdk_status}
                 )
+            elif event_type == "get_gesture_status":
+                await client.send_json(gesture.status())
             elif event_type == "chat_send":
                 text = str(data.get("text") or "").strip()
                 if text:
@@ -959,28 +1041,12 @@ async def run_dashboard(
                             speed_kmh=float(speed) * 3.6 if speed is not None else None,
                         )
             elif event_type == "set_location":
-                lat = float(data.get("lat", 0))
-                lon = float(data.get("lon", 0))
-                if -90 <= lat <= 90 and -180 <= lon <= 180:
-                    if engine._location is not None:
-                        engine._location.set_manual(lat, lon)
-                        pos = engine._location.latest_position
-                        if pos:
-                            await client.send_json(
-                                {
-                                    "type": "runtime_status",
-                                    **engine.runtime_status(),
-                                    **sdk_status,
-                                }
-                            )
-                        broadcast({"type": "location_updated", "lat": lat, "lon": lon})
-                else:
-                    await client.send_json(
-                        {
-                            "type": "error",
-                            "message": "经纬度范围无效（lat: -90~90, lon: -180~180）",
-                        }
-                    )
+                await client.send_json(
+                    {
+                        "type": "error",
+                        "message": "手动坐标已停用；请使用 GPSD、浏览器授权或 Jetson Wi-Fi 定位",
+                    }
+                )
             elif event_type == "snapshot":
                 asyncio.create_task(
                     engine.process_text(
@@ -996,13 +1062,13 @@ async def run_dashboard(
                         {"type": "error", "message": "节拍连跳进行中，请先点击停止"}
                     )
                     return
-                style = data.get("style", "happy")
+                style = data.get("style", "random")
                 if motion:
                     logger.info("🕹 Dashboard 触发舞蹈: style=%s", style)
                     broadcast(
                         {"type": "motion_status", "action": "dancing", "style": style}
                     )
-                    asyncio.create_task(_run_motion(motion.dance(style)))
+                    _launch_motion(motion.dance(style))
                 else:
                     logger.warning(
                         "motion_dance 事件被忽略: motion 控制器不可用 (style=%s)", style
@@ -1036,15 +1102,15 @@ async def run_dashboard(
             elif event_type == "motion_nod":
                 if motion:
                     broadcast({"type": "motion_status", "action": "nodding"})
-                    asyncio.create_task(_run_motion(motion.nod(times=2)))
+                    _launch_motion(motion.nod(times=2))
             elif event_type == "motion_shake_head":
                 if motion:
                     broadcast({"type": "motion_status", "action": "shaking"})
-                    asyncio.create_task(_run_motion(motion.shake_head(times=2)))
+                    _launch_motion(motion.shake_head(times=2))
             elif event_type == "motion_wave":
                 if motion:
                     broadcast({"type": "motion_status", "action": "waving"})
-                    asyncio.create_task(_run_motion(motion.wave_antenna("both")))
+                    _launch_motion(motion.wave_antenna("both"))
             elif event_type == "motion_pose":
                 if motion or reachy:
                     action = data.get("action", "")
@@ -1052,13 +1118,13 @@ async def run_dashboard(
                         if reachy:
                             reachy.goto_sleep()
                         elif motion:
-                            asyncio.create_task(_run_motion(motion.sleep()))
+                            _launch_motion(motion.sleep())
                         broadcast({"type": "motion_status", "action": "sleeping"})
                     elif action == "wake_up":
                         if reachy:
-                            reachy.wake_up()
+                            _launch_motion(_wake_up_reachy(reachy, attempts=1))
                         elif motion:
-                            asyncio.create_task(_run_motion(motion.wake_up()))
+                            _launch_motion(motion.wake_up())
                         broadcast({"type": "motion_status", "action": "ready"})
 
         async def _run_motion(coro) -> None:
@@ -1068,6 +1134,18 @@ async def run_dashboard(
                 logger.exception("Motion command failed")
             finally:
                 broadcast({"type": "motion_status", "action": "idle"})
+
+        def _launch_motion(coro: Any) -> None:
+            task = asyncio.create_task(_run_motion(coro))
+            motion_tasks.add(task)
+            task.add_done_callback(motion_tasks.discard)
+
+        async def _cancel_motion_tasks() -> None:
+            tasks = tuple(motion_tasks)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         try:
             await run_websocket_session(ws, hub, _snapshot, _handle_control)
@@ -1110,6 +1188,7 @@ async def run_dashboard(
                 if camera_backend
                 else "unavailable",
                 "front_frame_age_s": mjpeg.frame_age_s,
+                "gesture": gesture.status() if gesture is not None else None,
                 "rear_camera_configured": bool(
                     cfg.ezviz_app_key
                     and cfg.ezviz_app_secret
@@ -1130,6 +1209,7 @@ async def run_dashboard(
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
         """Liveness endpoint that reports robot readiness without secrets."""
+        runtime = engine.runtime_status()
         try:
             from importlib.metadata import version
 
@@ -1147,12 +1227,21 @@ async def run_dashboard(
                 "daemon_health": sdk_status.get("daemon_health", "unavailable"),
                 "daemon_owner": sdk_status.get("daemon_owner", "none"),
                 "daemon_error": sdk_status.get("daemon_error"),
+                "daemon_command": sdk_status.get("daemon_command"),
+                "daemon_headless": sdk_status.get("daemon_headless"),
                 "audio_backend": (
                     engine._audio.backend_name
                     if engine._audio is not None
                     else "unavailable"
                 ),
                 "state": engine._state,
+                "model": runtime.get("model"),
+                "search_policy": runtime.get("search_policy"),
+                "search": runtime.get("search"),
+                "vision": runtime.get("vision"),
+                "gesture": gesture.status() if gesture is not None else None,
+                "asr": runtime.get("asr"),
+                "location": runtime.get("location"),
             }
         )
 
@@ -1240,20 +1329,30 @@ async def run_dashboard(
 
     @app.post("/debug/search/toggle")
     async def debug_search_toggle(req: SearchToggleRequest) -> JSONResponse:
-        """Toggle Bailian web search on/off."""
+        """Compatibility switch: map Dashboard boolean to auto/off policy."""
+        cfg.search_policy = "auto" if req.enabled else "off"
         cfg.enable_search = req.enabled
-        broadcast({"type": "search", "enabled": req.enabled})
-        return JSONResponse({"ok": True, "search_enabled": cfg.enable_search})
+        broadcast({"type": "search", "enabled": req.enabled, "policy": cfg.search_policy})
+        return JSONResponse({"ok": True, "search_enabled": cfg.enable_search, "search_policy": cfg.search_policy})
 
     @app.get("/debug/search/status")
     async def debug_search_status() -> JSONResponse:
-        return JSONResponse({"search_enabled": cfg.enable_search})
+        return JSONResponse({"search_enabled": cfg.search_policy != "off", "search_policy": cfg.search_policy})
 
     # ── Start engine ──
     # Resolve audio and start the engine before advertising a healthy server.
     # Auto mode therefore fails loudly instead of leaving a misleading
     # Dashboard running on the Mac's default microphone.
     await engine.start()
+    from chaihuo_reachy.gesture_interaction import GestureInteractionController
+
+    gesture = GestureInteractionController(
+        cfg,
+        frame_source=mjpeg,
+        motion=motion,
+        audio=engine._audio,
+        status_callback=broadcast,
+    )
 
     # ── Periodic audio level broadcast ────────────────────────────────
     async def _broadcast_audio_level() -> None:
@@ -1379,6 +1478,8 @@ async def run_dashboard(
         print("\n👋 皮皮虾下线！")
     finally:
         _arm_shutdown_backstop()
+        if gesture is not None:
+            await gesture.stop()
         if manage_reachy_lifecycle:
             await _sleep_reachy_on_shutdown(reachy, cfg)
         mjpeg.stop()
@@ -1596,6 +1697,13 @@ def _resolve_daemon_serial_port(cfg: Config) -> str:
     return str(candidates[0])
 
 
+def _clear_persisted_startup_app() -> None:
+    """Prevent the SDK daemon from launching any previously selected app."""
+    from reachy_mini.daemon.startup_app_config import set_startup_app
+
+    set_startup_app(None)
+
+
 def _spawn_sdk_daemon_process(cfg: Config, resolved_serial_port: str | None = None):
     """Start the SDK daemon and retain an owned process handle for cleanup.
 
@@ -1621,7 +1729,21 @@ def _spawn_sdk_daemon_process(cfg: Config, resolved_serial_port: str | None = No
             executable = str(venv_daemon)
     if not executable:
         raise RuntimeError("reachy-mini-daemon executable was not found")
-    command = [executable]
+    # The daemon is a headless hardware driver, not an application launcher.
+    # Clear any app persisted by the official desktop client before every
+    # owned start so it cannot reappear after a reboot or SDK update.
+    try:
+        _clear_persisted_startup_app()
+    except Exception:
+        logger.warning("无法清空 Reachy daemon startup_app 配置", exc_info=True)
+
+    command = [
+        executable,
+        "--autostart",
+        "--headless",
+        "--no-wake-up-on-start",
+        "--goto-sleep-on-stop",
+    ]
     # Validation/recovery is performed by the lifecycle flow before this
     # low-level launcher is called.  Keeping the launcher deterministic also
     # makes it usable by deployment tooling that already resolved a device.
@@ -1635,6 +1757,10 @@ def _spawn_sdk_daemon_process(cfg: Config, resolved_serial_port: str | None = No
     if cfg.media_backend == "no_media":
         command.append("--no-media")
     process = subprocess.Popen(command, start_new_session=True)
+    logger.info("已启动无界面 SDK daemon: %s", " ".join(command))
+    logger.info(
+        "daemon 未请求 Control GUI；若仍出现窗口，请检查 macOS 登录项或外部 Reachy Tray App"
+    )
     if getattr(process, "pid", None):
         daemon_runtime.write_state(
             cfg.daemon_state_file,
@@ -1780,6 +1906,9 @@ async def _wake_up_reachy(reachy: Any, *, attempts: int = 3) -> bool:
     """Wake the robot with bounded retries after daemon readiness."""
     for attempt in range(1, attempts + 1):
         try:
+            # The daemon may be reachable while its motors are still disabled.
+            # Reachy Mini must enable torque before it can leave the sleep pose.
+            await asyncio.to_thread(reachy.enable_motors)
             await asyncio.to_thread(reachy.wake_up)
             logger.info("✅ 皮皮虾已就绪 — 头部归位，天线展开")
             return True
@@ -2080,6 +2209,7 @@ async def _try_connect_daemon_impl(cfg: Config) -> tuple:
         await _close_reachy_runtime(reachy)
         raise
 
+    owned_state = daemon_runtime.read_state(cfg.daemon_state_file)
     sdk_status = {
         "sdk_connected": True,
         "mode": "daemon_connected",
@@ -2100,6 +2230,12 @@ async def _try_connect_daemon_impl(cfg: Config) -> tuple:
         ),
         "daemon_port": cfg.daemon_port,
         "serial_port": cfg.daemon_serial_port or None,
+        "daemon_command": (
+            owned_state.get("command") if isinstance(owned_state, dict) else None
+        ),
+        "daemon_headless": bool(
+            isinstance(owned_state, dict) and owned_state.get("headless")
+        ),
     }
     logger.info("✅ Daemon 连接成功: %s", sdk_status)
     return (reachy, audio_backend, camera_backend, motion, beat_dance, sdk_status)

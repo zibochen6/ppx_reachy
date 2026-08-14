@@ -7,7 +7,11 @@ import time
 
 import pytest
 
-from chaihuo_reachy.motion import MotionController
+from chaihuo_reachy.motion import (
+    DANCE_CHOREOGRAPHIES,
+    MotionController,
+    resolve_dance_style,
+)
 
 
 class _FlakyReachy:
@@ -108,7 +112,28 @@ async def test_dance_random_selects_a_known_style() -> None:
     reachy = _FlakyReachy(fail_first=0)
     motion = MotionController(reachy)  # type: ignore[arg-type]
     summary = await motion.dance("random", beat_s=0.1)
-    assert summary["style"] in {"happy", "swing", "robot"}
+    assert summary["style"] in set(DANCE_CHOREOGRAPHIES)
+
+
+def test_resolve_dance_style_identity_and_random() -> None:
+    assert resolve_dance_style("happy") == "happy"
+    assert resolve_dance_style("swing") == "swing"
+    assert resolve_dance_style("robot") == "robot"
+    assert resolve_dance_style("random") in set(DANCE_CHOREOGRAPHIES)
+
+
+@pytest.mark.asyncio
+async def test_every_choreography_completes() -> None:
+    # Every style must be a non-empty valid sequence that a healthy Reachy
+    # can dance through without skipping steps.
+    reachy = _FlakyReachy(fail_first=0)
+    motion = MotionController(reachy)  # type: ignore[arg-type]
+    for style, steps in DANCE_CHOREOGRAPHIES.items():
+        assert steps, f"{style} has no choreography steps"
+        assert all(beats >= 1 for _, beats in steps), f"{style} has a <1 beat step"
+        summary = await motion.dance(style, beat_s=0.1)
+        assert summary["style"] == style
+        assert summary["skipped"] == 0
 
 
 # ── Continuous speech offsets during actual speaker playback ───────────
