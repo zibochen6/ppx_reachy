@@ -1,0 +1,66 @@
+# 诊断报告：Reachy Mini daemon 睡眠态启动误判
+
+> 生成于 2026-08-14 · 路径：软件 · 设备：mcv-j50 / Jetson AGX Orin
+
+## 设备信息
+
+- **SoC**：Jetson AGX Orin
+- **JetPack**：6.2.1
+- **L4T**：36.4.4
+- **Python**：3.10.12
+- **Reachy Mini SDK**：1.9.0rc1
+- **串口**：/dev/ttyACM0
+- **修复后状态**：sdk_connected=true, robot_ready=true
+
+## 问题描述
+
+Dashboard、前置摄像头和音频可用，但机器人状态显示未发现健康 daemon，进入手势模式时报机器人运动控制未就绪。
+
+## 根因分析
+
+### 假设 1：SDK 睡眠态 ready=false 被误判为硬件初始化失败
+- **依据**：独立 daemon 状态为 running、motor_control_mode=disabled、控制环约 49 Hz、nb_error=0，但应用持续等待 ready=true 30 秒后主动终止 daemon。
+- **验证方法**：启动 no-media daemon 并读取 /api/daemon/status；确认禁用电机时控制环健康且没有 backend error。
+
+### 假设 2：电机串口或供电异常
+- **依据**：历史日志曾出现全电机通信中断，但本次 /dev/ttyACM0、USB 枚举、9 个电机配置和 5V 电压均正常。
+- **验证方法**：检查 /dev/ttyACM0、dmesg、daemon 电机枚举与 control_loop_stats。
+
+## 解决方案
+
+### 步骤 1：允许连接健康的电机禁用态 daemon
+```bash
+校验 state=running、无 backend error、motor_control_mode=disabled、控制环 >=20 Hz 且 nb_error=0 后建立 SDK 连接
+```
+> 仍拒绝控制环错误、频率不足或 backend error；没有降低硬件故障检查。
+
+### 步骤 2：连接后按安全顺序唤醒
+```bash
+reachy.enable_motors(); reachy.wake_up()
+```
+> 重启服务时机器人会从睡眠姿态站起，应确保周围无障碍物。
+
+### 步骤 3：重启并验收服务
+```bash
+sudo systemctl restart chaihuo-reachy.service
+```
+> 验收 healthz、daemon 控制环、TensorRT 手势模式启停及唤醒词恢复。
+
+## 风险与回滚
+
+**风险**：
+- 服务重启后自动使能电机并站起，机器人周围需要留出运动空间。
+- 不能仅凭 ready=false 放行；必须同时验证控制环频率和错误数。
+
+**回滚**：
+- 远端恢复 state/fix-backup-20260814-daemon-ready/main.py 与 test_daemon_startup.py，然后重启 chaihuo-reachy.service。
+- 紧急停止可执行 sudo systemctl stop chaihuo-reachy.service，owned daemon 会随服务清理。
+
+## 引用资源
+
+- **JetPack 知识库**：`references/jetpack-knowledge.md`
+- **软件诊断模式**：`references/sw-diagnostic-patterns.md`
+
+---
+
+_本报告由 jetson-troubleshooter skill 生成。_

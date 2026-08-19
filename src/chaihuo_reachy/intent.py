@@ -133,9 +133,15 @@ _MOTION_TERMS = (
     "来段舞",
     "来支舞",
 )
-# "跳一段舞" / "跳支舞" / "跳一下舞" — 跳与舞之间隔了修饰字,
-# 连续子串匹配不到,用宽松模式兜底。
-_MOTION_DANCE_RE = re.compile(r"跳.{0,4}舞")
+# "跳一段舞" / "跳一个不一样的舞蹈" — 跳与舞之间可能隔着修饰语，
+# 连续子串匹配不到，用宽松模式兜底。描述刚才动作的问题不能再次触发
+# 舞蹈，否则“你刚才跳的是骑马舞吗”会被误当成新命令。
+_MOTION_DANCE_RE = re.compile(r"跳.{0,10}舞")
+_MOTION_DANCE_DESCRIPTION_RE = re.compile(
+    r"(?:刚才|刚刚|之前).{0,12}跳.{0,12}舞|"
+    r"你是跳的.{0,10}舞.{0,3}[吗么]|"
+    r"跳的是.{0,10}舞.{0,3}[吗么]"
+)
 _JOURNAL_TERMS = (
     # 明确基地车/旅程语境的词；通用词（城市/高校/乡村等）不在此列，
     # 否则科普常识问题（如"城市为什么堵车"）会被误判为日记检索。
@@ -284,8 +290,10 @@ def classify_intent(text: str) -> IntentDecision:
     if _LIVE_LOCATION_RE.search(normalized):
         return IntentDecision(TurnIntent.LOCATION, "live location requested")
 
-    if any(term in normalized for term in _MOTION_TERMS) or _MOTION_DANCE_RE.search(
-        normalized
+    motion_description = _MOTION_DANCE_DESCRIPTION_RE.search(normalized)
+    if not motion_description and (
+        any(term in normalized for term in _MOTION_TERMS)
+        or _MOTION_DANCE_RE.search(normalized)
     ):
         return IntentDecision(TurnIntent.MOTION, "explicit robot motion requested")
 

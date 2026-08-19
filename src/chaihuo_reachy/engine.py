@@ -346,6 +346,8 @@ class ConversationEngine:
         self._location: LocationService | None = None
         self._wake: Any | None = None  # WakeWordDetector (local KWS) or None
         self._task: asyncio.Task | None = None
+        self._voice_listen_task: asyncio.Task[str] | None = None
+        self._voice_listener_preempted = False
         self._loop: asyncio.AbstractEventLoop | None = None
 
         # Conversation state
@@ -707,49 +709,81 @@ class ConversationEngine:
                 self._set_state("dancing")
             await asyncio.sleep(0.2)
             return
-        async with self._turn_lock:
-            await self._run_voice_turn()
+        # Waiting for a wake word can take tens of seconds and must not own
+        # the response lock: typed Dashboard messages need to preempt that
+        # passive microphone wait immediately.
+        if self._turn_lock.locked():
+            await asyncio.sleep(0.05)
+            return
+        await self._run_voice_turn()
 
     async def _run_voice_turn(self) -> None:
         """One full turn: listen → think → speak."""
         # ── 1. Listen ──
         self._set_state("listening")
 
-        user_text = await self._listen_for_speech()
-
-        if not user_text:
-            # During the 30s wake-free window, pause briefly before retrying
-            # to avoid hammering the cloud ASR with rapid reconnections.
-            if time.monotonic() < self._wake_word_active_until:
-                await asyncio.sleep(1.0)
-            await self._maybe_recover_audio()
+        listen_task = asyncio.create_task(self._listen_for_speech())
+        self._voice_listen_task = listen_task
+        try:
+            user_text = await listen_task
+        except asyncio.CancelledError:
+            # A Dashboard text turn cancels only the passive listener.  A
+            # lifecycle cancellation (engine.stop / gesture takeover) must
+            # still propagate and terminate the conversation loop.
+            if not self._voice_listener_preempted:
+                raise
+            self._voice_listener_preempted = False
             return
+        finally:
+            if self._voice_listen_task is listen_task:
+                self._voice_listen_task = None
 
-        logger.info("ASR final: %r", user_text)
-        user_text = self._accept_transcript(user_text)
-        if not user_text:
-            self._set_state("idle")
-            return
+        async with self._turn_lock:
+            if not user_text:
+                # During the 30s wake-free window, pause briefly before retrying
+                # to avoid hammering the cloud ASR with rapid reconnections.
+                if time.monotonic() < self._wake_word_active_until:
+                    await asyncio.sleep(1.0)
+                await self._maybe_recover_audio()
+                return
 
-        if user_text == _WAKE_ONLY:
-            await self._speak_wake_response()
-            self._set_state("idle")
-            return
+            logger.info("ASR final: %r", user_text)
+            user_text = self._accept_transcript(user_text)
+            if not user_text:
+                self._set_state("idle")
+                return
 
-        await self._coordinate_turn(user_text, source="voice", speak=True)
-        # Refresh the wake-free window so the user can continue the
-        # conversation without saying the wake word on every turn.
-        if self.config.enable_wake_word:
-            self._wake_word_active_until = time.monotonic() + (
-                0.0
-                if self._off_axis_ambient
-                else (
-                    self.config.followup_window_s
-                    if self.config.audio_frontend_v2
-                    else self.config.wake_word_timeout_s
+            if user_text == _WAKE_ONLY:
+                await self._speak_wake_response()
+                self._set_state("idle")
+                return
+
+            await self._coordinate_turn(user_text, source="voice", speak=True)
+            # Refresh the wake-free window so the user can continue the
+            # conversation without saying the wake word on every turn.
+            if self.config.enable_wake_word:
+                self._wake_word_active_until = time.monotonic() + (
+                    0.0
+                    if self._off_axis_ambient
+                    else (
+                        self.config.followup_window_s
+                        if self.config.audio_frontend_v2
+                        else self.config.wake_word_timeout_s
+                    )
                 )
-            )
-            self._off_axis_ambient = False
+                self._off_axis_ambient = False
+
+    async def _cancel_voice_listener(self) -> None:
+        """Cancel a passive wake/ASR wait before a Dashboard text turn."""
+        task = self._voice_listen_task
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        self._voice_listener_preempted = True
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     # ── ASR: mic → text ────────────────────────────────────────────────
     async def _listen_for_speech(self) -> str:
@@ -1978,7 +2012,13 @@ class ConversationEngine:
                         ),
                         on_done=tts_done_flag.set,
                     )
-                    await tts.open()
+                    # Do not open a realtime TTS session until the LLM has
+                    # produced actual text.  Calling finish() on a session
+                    # that never received text makes Qwen wait for its full
+                    # 60-second timeout and leaves the Dashboard looking
+                    # permanently stuck on "thinking".
+                    opened = False
+                    fed_text = False
                     try:
                         while not llm_done_flag.is_set() or not tts_text_queue.empty():
                             if self._barge_in_requested:
@@ -1989,16 +2029,21 @@ class ConversationEngine:
                                 )
                                 if self._barge_in_requested:
                                     break
+                                if not opened:
+                                    await tts.open()
+                                    opened = True
                                 await tts.feed(text)
+                                fed_text = True
                             except asyncio.TimeoutError:
                                 continue
-                        if not self._barge_in_requested:
+                        if fed_text and not self._barge_in_requested:
                             await tts.flush()
                     except Exception:
                         logger.exception("TTS worker error")
                         tts_done_flag.set()
                     finally:
-                        await tts.close()
+                        if opened:
+                            await tts.close()
 
                 tts_task = asyncio.create_task(_tts_worker())
 
@@ -2538,6 +2583,7 @@ class ConversationEngine:
                 "turn_id": "",
             }
         async with self._turn_lock:
+            await self._cancel_voice_listener()
             return await self._coordinate_turn(
                 normalized,
                 source=source,

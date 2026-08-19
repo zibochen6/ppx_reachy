@@ -1844,10 +1844,32 @@ def _daemon_is_initializing(error: str, daemon_process: Any | None) -> bool:
 
 def _backend_reports_live_control(backend: dict[str, Any]) -> bool:
     """Accept the SDK 1.9 false-negative ready flag only with live control."""
-    stats = backend.get("control_loop_stats")
     return (
         str(backend.get("motor_control_mode") or "").lower() == "enabled"
-        and isinstance(stats, dict)
+        and _backend_control_loop_is_healthy(backend)
+    )
+
+
+def _backend_can_enable_control(backend: dict[str, Any]) -> bool:
+    """Recognize a healthy sleeping daemon before the client enables torque.
+
+    Reachy Mini SDK 1.9.0rc1 reports ``ready=false`` while the motor control
+    mode is disabled, even though the serial link and 50 Hz controller are
+    healthy.  The application must connect in this state so it can call
+    ``enable_motors()`` followed by ``wake_up()``; waiting for ``ready=true``
+    first creates an impossible startup dependency.
+    """
+    return (
+        str(backend.get("motor_control_mode") or "").lower() == "disabled"
+        and _backend_control_loop_is_healthy(backend)
+    )
+
+
+def _backend_control_loop_is_healthy(backend: dict[str, Any]) -> bool:
+    """Require an error-free live controller before trusting stale readiness."""
+    stats = backend.get("control_loop_stats")
+    return (
+        isinstance(stats, dict)
         and int(stats.get("nb_error", 1)) == 0
         and float(stats.get("mean_control_loop_frequency", 0.0)) >= 20.0
     )
@@ -1889,6 +1911,11 @@ async def _daemon_backend_error(host: str, port: int, cfg: Config | None = None)
             if _backend_reports_live_control(backend):
                 logger.warning(
                     "daemon backend ready=false，但电机控制环正常运行；按兼容模式继续"
+                )
+                return ""
+            if _backend_can_enable_control(backend):
+                logger.info(
+                    "daemon 电机处于安全禁用状态且控制环正常；连接后执行电机使能"
                 )
                 return ""
             return "机器人硬件未就绪 (backend_status.ready=false)"

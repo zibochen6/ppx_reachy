@@ -962,6 +962,125 @@ async def test_speaking_paths_skipped_while_dancing() -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_llm_stream_does_not_open_or_flush_tts(monkeypatch) -> None:
+    import chaihuo_reachy.engine as engine_module
+
+    tts_events: list[str] = []
+
+    class EmptyLLM:
+        last_sources: list[dict] = []
+        last_search_used = False
+        last_search_error = ""
+
+        def __init__(self, _config) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def response_stream(self, *_args, **_kwargs):
+            if False:
+                yield ""
+
+    class TrackingTTS:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def open(self) -> None:
+            tts_events.append("open")
+
+        async def feed(self, _text: str) -> None:
+            tts_events.append("feed")
+
+        async def flush(self) -> None:
+            tts_events.append("flush")
+
+        async def close(self) -> None:
+            tts_events.append("close")
+
+    class Audio:
+        capture_rms = 0.0
+        is_playing = False
+
+        def set_output_sample_rate(self, _sample_rate: int) -> None:
+            pass
+
+        async def start_capture(self):
+            if False:
+                yield b""
+
+        async def play(self, _pcm: bytes) -> None:
+            pass
+
+        def mark_playback_done(self) -> None:
+            pass
+
+    monkeypatch.setattr(engine_module, "BailianLLMClient", EmptyLLM)
+    monkeypatch.setattr(engine_module, "BailianTTSClient", TrackingTTS)
+    engine = ConversationEngine(
+        Config(barge_in_enabled=False, post_playback_silence_s=0),
+        audio_backend=Audio(),  # type: ignore[arg-type]
+    )
+
+    text, emotion = await asyncio.wait_for(
+        engine._think_and_speak([{"role": "user", "content": "你好"}]),
+        timeout=0.5,
+    )
+
+    assert text == ""
+    assert emotion == ""
+    assert tts_events == []
+
+
+@pytest.mark.asyncio
+async def test_dashboard_text_preempts_passive_voice_listener() -> None:
+    engine = ConversationEngine(Config())
+    listening = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def passive_listen() -> str:
+        listening.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return ""
+
+    async def coordinate(text: str, **kwargs):
+        return {
+            "reply": "对话正常。",
+            "emotion": "",
+            "memory_context": "",
+            "vision_context": "",
+            "intent": "general",
+            "sources": [],
+            "error": None,
+            "turn_id": "test-turn",
+            "text": text,
+            "source": kwargs.get("source"),
+        }
+
+    engine._listen_for_speech = passive_listen  # type: ignore[method-assign]
+    engine._coordinate_turn = coordinate  # type: ignore[method-assign]
+    voice_turn = asyncio.create_task(engine._run_voice_turn())
+    await asyncio.wait_for(listening.wait(), timeout=0.2)
+
+    result = await asyncio.wait_for(
+        engine.process_text("稳定性测试", client_message_id="web-test"),
+        timeout=0.2,
+    )
+    await asyncio.wait_for(voice_turn, timeout=0.2)
+
+    assert cancelled.is_set()
+    assert result["reply"] == "对话正常。"
+    assert result["source"] == "dashboard"
+
+
+@pytest.mark.asyncio
 async def test_playback_drain_skips_is_playing_while_dancing() -> None:
     class _FullAudio(_MusicFakeAudio):
         @property

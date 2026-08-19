@@ -41,6 +41,7 @@ from chaihuo_reachy.intent import TurnIntent, classify_intent
         ("跳个舞", TurnIntent.MOTION),
         ("跳一段舞", TurnIntent.MOTION),
         ("按照你的性格随便跳一段舞", TurnIntent.MOTION),
+        ("跳一个不一样的舞蹈", TurnIntent.MOTION),
         ("跳支舞吧", TurnIntent.MOTION),
         ("来一段摇摆", TurnIntent.MOTION),
         ("来支舞", TurnIntent.MOTION),
@@ -48,6 +49,8 @@ from chaihuo_reachy.intent import TurnIntent, classify_intent
         ("点点头", TurnIntent.MOTION),
         ("挥挥天线", TurnIntent.MOTION),
         ("去睡觉", TurnIntent.MOTION),
+        ("你刚才跳的是骑马舞吗", TurnIntent.GENERAL),
+        ("他，你是跳的骑马舞吗？", TurnIntent.GENERAL),
     ],
 )
 def test_critical_intent_routes(text: str, expected: TurnIntent) -> None:

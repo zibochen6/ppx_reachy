@@ -29,13 +29,16 @@ async def test_responses_stream_collects_web_source_and_text() -> None:
         },
         {"type": "response.output_text.delta", "delta": "深圳今天晴。"},
     ]
-    body = "".join(f"data: {json.dumps(item)}\n\n" for item in events) + "data: [DONE]\n\n"
+    # Bailian emits SSE without a space after ``data:``.
+    body = "".join(f"data:{json.dumps(item)}\n\n" for item in events) + "data:[DONE]\n\n"
 
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path.endswith("/responses")
         payload = json.loads(request.content)
         assert payload["tool_choice"] == "auto"
         assert payload["search_options"]["forced_search"] is True
+        assert payload["enable_thinking"] is False
+        assert payload["tools"] == [{"type": "web_search"}]
         return httpx.Response(200, text=body)
 
     llm = BailianLLMClient(Config(bailian_api_key="test"))
@@ -96,6 +99,86 @@ async def test_search_failure_retries_before_fallback(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_responses_failure_event_without_sse_space_falls_back(monkeypatch) -> None:
+    monkeypatch.setattr(llm_module, "_SEARCH_CIRCUIT_OPEN_UNTIL", 0.0)
+    calls = 0
+    error = {
+        "type": "response.failed",
+        "response": {
+            "error": {
+                "code": "InvalidParameter",
+                "message": "normal mode does not support this tool",
+            }
+        },
+    }
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, text=f"data:{json.dumps(error)}\n\n")
+
+    llm = BailianLLMClient(Config(bailian_api_key="test"))
+    llm._client = httpx.AsyncClient(
+        base_url="https://example.invalid", transport=httpx.MockTransport(handler)
+    )
+
+    async def fallback(_messages):
+        yield "已回退到普通回答。"
+
+    monkeypatch.setattr(llm, "_fallback_stream", fallback)
+    try:
+        tokens = [
+            token
+            async for token in llm.response_stream(
+                [{"role": "user", "content": "为什么"}], search_mode="auto"
+            )
+        ]
+    finally:
+        await llm._client.aclose()
+
+    assert calls == 3
+    assert tokens == ["已回退到普通回答。"]
+    assert "normal mode" in llm.last_search_error
+
+
+@pytest.mark.asyncio
+async def test_empty_responses_stream_retries_then_falls_back(monkeypatch) -> None:
+    monkeypatch.setattr(llm_module, "_SEARCH_CIRCUIT_OPEN_UNTIL", 0.0)
+    calls = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            text='data:{"type":"response.completed"}\n\n',
+        )
+
+    llm = BailianLLMClient(Config(bailian_api_key="test"))
+    llm._client = httpx.AsyncClient(
+        base_url="https://example.invalid", transport=httpx.MockTransport(handler)
+    )
+
+    async def fallback(_messages):
+        yield "模型暂时无文本，已自动回退。"
+
+    monkeypatch.setattr(llm, "_fallback_stream", fallback)
+    try:
+        tokens = [
+            token
+            async for token in llm.response_stream(
+                [{"role": "user", "content": "你好"}], search_mode="auto"
+            )
+        ]
+    finally:
+        await llm._client.aclose()
+
+    assert calls == 3
+    assert tokens == ["模型暂时无文本，已自动回退。"]
+    assert "without output text" in llm.last_search_error
+
+
+@pytest.mark.asyncio
 async def test_responses_function_call_waits_for_output_before_final_text() -> None:
     requests: list[dict] = []
     rounds = [
@@ -122,9 +205,9 @@ async def test_responses_function_call_waits_for_output_before_final_text() -> N
         requests.append(payload)
         events = rounds[len(requests) - 1]
         body = "".join(
-            f"data: {json.dumps(item, ensure_ascii=False)}\n\n" for item in events
+            f"data:{json.dumps(item, ensure_ascii=False)}\n\n" for item in events
         )
-        return httpx.Response(200, text=body + "data: [DONE]\n\n")
+        return httpx.Response(200, text=body + "data:[DONE]\n\n")
 
     observed: list[dict] = []
 

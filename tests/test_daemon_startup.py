@@ -313,6 +313,93 @@ async def test_live_controller_is_accepted_when_sdk_ready_flag_is_stale(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_sleeping_controller_is_accepted_before_motor_enable(monkeypatch) -> None:
+    import httpx
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "state": "running",
+                "simulation_enabled": False,
+                "backend_status": {
+                    "ready": False,
+                    "error": None,
+                    "motor_control_mode": "disabled",
+                    "control_loop_stats": {
+                        "mean_control_loop_frequency": 48.9,
+                        "nb_error": 0,
+                    },
+                },
+            }
+
+    class Client:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def get(self, _url):
+            return Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+
+    assert await main_module._daemon_backend_error(
+        "localhost", 8000, Config(daemon_simulation=False)
+    ) == ""
+
+
+@pytest.mark.asyncio
+async def test_disabled_controller_with_errors_is_still_rejected(monkeypatch) -> None:
+    import httpx
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "state": "running",
+                "simulation_enabled": False,
+                "backend_status": {
+                    "ready": False,
+                    "error": None,
+                    "motor_control_mode": "disabled",
+                    "control_loop_stats": {
+                        "mean_control_loop_frequency": 48.9,
+                        "nb_error": 1,
+                    },
+                },
+            }
+
+    class Client:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def get(self, _url):
+            return Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+
+    error = await main_module._daemon_backend_error(
+        "localhost", 8000, Config(daemon_simulation=False)
+    )
+    assert "ready=false" in error
+
+
+@pytest.mark.asyncio
 async def test_ctrl_c_during_startup_stops_the_owned_daemon(monkeypatch, tmp_path) -> None:
     events: list[str] = []
 

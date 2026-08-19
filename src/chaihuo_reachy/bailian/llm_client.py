@@ -90,21 +90,26 @@ class BailianLLMClient:
                 )
                 raise RuntimeError(f"LLM request failed: HTTP {response.status_code}")
 
+            emitted = False
             async for line in response.aiter_lines():
-                if line.startswith("data: "):
-                    data = line[6:]
-                    if data == "[DONE]":
-                        return
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    choices = chunk.get("choices", [])
-                    if choices:
-                        delta = choices[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            yield content
+                data = _sse_data(line)
+                if data is None:
+                    continue
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        emitted = True
+                        yield content
+            if not emitted:
+                raise RuntimeError("Chat API completed without output text")
 
     async def chat(
         self,
@@ -191,13 +196,14 @@ class BailianLLMClient:
             "stream": True,
             "store": False,
             "enable_thinking": False,
-            "tools": [{"type": "web_search"}, {"type": "web_extractor"}],
+            # qwen3.7 normal mode rejects web_extractor unless thinking is
+            # enabled.  Keep the low-latency non-thinking path and use the
+            # supported web_search tool only.
+            "tools": [{"type": "web_search"}],
             "tool_choice": "auto",
         }
         if search_mode == "required":
-            # Bailian only permits tool_choice=required with a single tool;
-            # forced_search is the supported way to require web search while
-            # keeping web_extractor available for follow-up page reading.
+            # forced_search is the supported way to require a web lookup.
             body["search_options"] = {"forced_search": True}
         assert self._client is not None
         last_error: Exception | None = None
@@ -213,12 +219,13 @@ class BailianLLMClient:
                         raise RuntimeError(
                             f"Responses API HTTP {response.status_code}: {detail}"
                         )
+                    completed_text = ""
                     async for line in response.aiter_lines():
-                        if not line.startswith("data: "):
+                        raw = _sse_data(line)
+                        if raw is None:
                             continue
-                        raw = line[6:]
                         if raw == "[DONE]":
-                            return
+                            break
                         try:
                             event = json.loads(raw)
                         except json.JSONDecodeError:
@@ -236,8 +243,17 @@ class BailianLLMClient:
                             if delta:
                                 emitted = True
                                 yield delta
+                        elif event_type == "response.output_text.done":
+                            completed_text = str(event.get("text") or "")
                         elif event_type in {"response.failed", "error"}:
                             raise RuntimeError(_response_error(event))
+                    if not emitted and completed_text:
+                        emitted = True
+                        yield completed_text
+                    if not emitted:
+                        raise RuntimeError(
+                            "Responses API completed without output text"
+                        )
                 return
             except Exception as exc:
                 last_error = exc
@@ -278,7 +294,7 @@ class BailianLLMClient:
         while True:
             active_tools: list[dict[str, Any]] = []
             if search_mode != "off":
-                active_tools.extend([{"type": "web_search"}, {"type": "web_extractor"}])
+                active_tools.append({"type": "web_search"})
             if rounds < max_tool_rounds:
                 active_tools.extend(custom_tools)
             body: dict[str, Any] = {
@@ -357,6 +373,7 @@ class BailianLLMClient:
     ) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
         assert self._client is not None
         text_parts: list[str] = []
+        completed_text = ""
         output_items: list[dict[str, Any]] = []
         calls: list[dict[str, Any]] = []
         async with self._client.stream(
@@ -369,9 +386,9 @@ class BailianLLMClient:
                 detail = (await response.aread()).decode(errors="replace")[:300]
                 raise RuntimeError(f"Responses API HTTP {response.status_code}: {detail}")
             async for line in response.aiter_lines():
-                if not line.startswith("data: "):
+                raw = _sse_data(line)
+                if raw is None:
                     continue
-                raw = line[6:]
                 if raw == "[DONE]":
                     break
                 try:
@@ -390,6 +407,8 @@ class BailianLLMClient:
                     delta = str(event.get("delta") or "")
                     if delta:
                         text_parts.append(delta)
+                elif event_type == "response.output_text.done":
+                    completed_text = str(event.get("text") or "")
                 elif event_type == "response.output_item.done":
                     item = event.get("item")
                     if isinstance(item, dict):
@@ -398,6 +417,10 @@ class BailianLLMClient:
                             calls.append(item)
                 elif event_type in {"response.failed", "error"}:
                     raise RuntimeError(_response_error(event))
+        if not text_parts and completed_text:
+            text_parts.append(completed_text)
+        if not text_parts and not calls:
+            raise RuntimeError("Responses API completed without output text")
         return text_parts, output_items, calls
 
     async def _tool_fallback_stream(
@@ -460,6 +483,18 @@ def _response_error(event: dict[str, Any]) -> str:
     if isinstance(error, dict):
         return str(error.get("message") or error.get("code") or "Responses API failed")
     return str(error or "Responses API failed")
+
+
+def _sse_data(line: str) -> str | None:
+    """Return an SSE data payload with or without the optional space.
+
+    Bailian currently emits ``data:{...}``, while several OpenAI-compatible
+    test fixtures and proxies emit ``data: {...}``.  SSE permits both forms.
+    Requiring the space silently discarded failures and output tokens.
+    """
+    if not line.startswith("data:"):
+        return None
+    return line[5:].lstrip()
 
 
 def _contains_web_tool(value: object) -> bool:
